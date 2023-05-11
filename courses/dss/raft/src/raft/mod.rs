@@ -1,5 +1,15 @@
+use futures::channel;
+use log::debug;
+use log::error;
+use log::info;
+use std::collections::HashMap;
+use std::sync::mpsc;
+use std::sync::mpsc::RecvError;
+use std::sync::mpsc::Sender;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use futures::channel::mpsc::UnboundedSender;
 
@@ -30,6 +40,21 @@ pub enum ApplyMsg {
     },
 }
 
+#[derive(Default, Clone, Debug)]
+struct Entry {
+    data: Vec<u8>,
+}
+
+struct StateInner {
+    // persistent state
+    pub term: u64,
+    voted_for: usize,
+    logs: Vec<Entry>,
+    // volatile state
+    pub is_leader: bool,
+    commit_index: usize,
+    last_applyed: usize,
+}
 /// State of a raft peer.
 #[derive(Default, Clone, Debug)]
 pub struct State {
@@ -90,7 +115,9 @@ impl Raft {
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
 
-        crate::your_code_here((rf, apply_ch))
+        // todo
+        // crate::your_code_here((rf, apply_ch))
+        rf
     }
 
     /// save Raft's persistent state to stable storage,
@@ -156,8 +183,18 @@ impl Raft {
         // });
         // rx
         // ```
-        let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
-        crate::your_code_here((server, args, tx, rx))
+        // let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
+        let peer = &self.peers[server];
+        let peer_clone = peer.clone();
+        let (tx, rx) = mpsc::channel();
+        peer.spawn(async move {
+            let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
+            let res = tx.send(res);
+            if res.is_err() {
+                panic!("send resp error {:?}", res)
+            }
+        });
+        rx
     }
 
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
@@ -207,6 +244,80 @@ impl Raft {
         let _ = &self.me;
         let _ = &self.persister;
         let _ = &self.peers;
+    }
+
+    pub fn get_state() -> State {
+        todo!()
+    }
+}
+
+enum RaftClientReply {
+    VoteReply,
+}
+enum RaftEvent {
+    TimeOut,
+    // todo
+    VoteRequest,
+    VoteReply,
+    ReadState,
+}
+
+// handle raft event ,start_read/time out/vote request
+struct RaftHandler {
+    recv: Receiver<RaftEvent>,
+    raft: Box<Raft>,
+}
+
+impl RaftHandler {
+    pub fn new(raft: Raft) -> (Self, Sender<RaftEvent>) {
+        let (tx, rx) = mpsc::channel();
+
+        let res = RaftHandler {
+            recv: rx,
+            raft: Box::new(raft),
+        };
+        (res, tx)
+    }
+
+    pub fn start(
+        mut self,
+        sx: Sender<RaftEvent>,
+    ) -> thread::JoinHandle<std::result::Result<(), Error>> {
+        let id = self.raft.me;
+        let handler = thread::spawn(move || self.main());
+        Self::time_out(id, sx);
+        handler
+    }
+
+    fn time_out(id: usize, sx: Sender<RaftEvent>) {
+        let _ = thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(100));
+            debug!("id {}time out ", id);
+            let res = sx.send(RaftEvent::TimeOut);
+            if res.is_err() {
+                debug!("time out send error");
+                return;
+            }
+        });
+    }
+
+    fn main(&mut self) -> Result<()> {
+        loop {
+            let res = self.recv.recv();
+            match res {
+                Err(RecvError) => {
+                    info!("raft handler chan receive error {},stop handle", RecvError);
+                    return Ok(());
+                }
+                // todo
+                Ok(event) => match event {
+                    RaftEvent::TimeOut => {
+                        debug!("recv time out event")
+                    }
+                    _ => {}
+                },
+            }
+        }
     }
 }
 
@@ -276,10 +387,11 @@ impl Node {
 
     /// The current state of this peer.
     pub fn get_state(&self) -> State {
-        State {
-            term: self.term(),
-            is_leader: self.is_leader(),
-        }
+        // State {
+        // term: self.term(),
+        // is_leader: self.is_leader(),
+        // }
+        todo!()
     }
 
     /// the tester calls kill() when a Raft instance won't be
@@ -330,5 +442,38 @@ impl RaftService for Node {
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         // Your code here (2A, 2B).
         crate::your_code_here(args)
+    }
+}
+
+#[cfg(test)]
+pub mod my_tests {
+    use std::{sync::Once, thread, time::Duration};
+
+    use futures::channel::mpsc::{unbounded, UnboundedReceiver};
+    use labrpc::Handler;
+
+    use super::{persister::SimplePersister, ApplyMsg, Raft, RaftHandler};
+
+    fn init_logger() {
+        static LOGGER_INIT: Once = Once::new();
+        LOGGER_INIT.call_once(env_logger::init);
+    }
+
+    #[test]
+    fn test_debug() {
+        init_logger();
+        error!("test log")
+    }
+    #[test]
+    fn test_start() {
+        init_logger();
+        let p = SimplePersister::new();
+        // let (tx, apply_ch:UnboundedReceiver<ApplyMsg>) = unbounded();
+        let (tx, apply_ch) = unbounded();
+        // let rf = Raft::new(clients, i, Box::new(self.saved[i].clone()), tx);
+        let raft = Raft::new(vec![], 0, Box::new(p), tx);
+        let (mut raft_handle, sx) = RaftHandler::new(raft);
+        let join = raft_handle.start(sx.clone());
+        thread::sleep(Duration::from_millis(2000));
     }
 }

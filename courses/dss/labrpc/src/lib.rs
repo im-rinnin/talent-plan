@@ -93,7 +93,9 @@ pub mod tests {
 
     #[test]
     fn test_service_dispatch() {
+        use log::info;
         init_logger();
+        info!("test");
 
         let mut builder = ServerBuilder::new("test".to_owned());
         let junk = JunkService::new();
