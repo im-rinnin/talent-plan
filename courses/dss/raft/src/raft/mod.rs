@@ -19,8 +19,6 @@ use std::thread::spawn;
 use std::time::Duration;
 use std::time::Instant;
 use std::todo;
-use timer::Guard;
-use timer::MessageTimer;
 
 use futures::channel::mpsc::UnboundedSender;
 
@@ -625,7 +623,6 @@ pub mod my_tests {
         executor::block_on,
     };
     use labrpc::Handler;
-    use timer::Guard;
 
     use super::{persister::SimplePersister, ApplyMsg, Node, Raft, RaftHandler};
 
@@ -643,19 +640,6 @@ pub mod my_tests {
         let raft_handle = RaftHandler::new(raft);
         raft_handle.start();
         thread::sleep(Duration::from_millis(2000));
-    }
-    #[test]
-    fn debug_time_out_check() {
-        extern crate timer;
-        extern crate chrono;
-        use std::sync::mpsc::channel;
-
-        let (tx, rx) = channel();
-        let timer = timer::MessageTimer::new(tx);
-        let _guard = timer.schedule_with_delay(chrono::Duration::seconds(3), 3);
-
-        rx.recv().unwrap();
-        println!("This code has been executed after 3 seconds");
     }
     #[test]
     fn test_rand_time_out() {
