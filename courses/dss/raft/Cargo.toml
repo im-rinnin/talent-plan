@@ -19,6 +19,8 @@ log = "0.4"
 prost = "0.6"
 prost-derive = "0.6"
 rand = "0.7"
+async-lock = "2.7.0"
+crossbeam-channel = "0.5.8"
 
 labcodec = { path = "../labcodec" }
 labrpc = { path = "../labrpc" }
