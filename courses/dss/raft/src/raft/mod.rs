@@ -52,8 +52,8 @@ pub enum ApplyMsg {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
 pub enum Role {
     LEADER = 0,
-    CANDIDATOR = 1,
-    FOLLOWER = 2,
+    FOLLOWER = 1,
+    CANDIDATOR = 2,
 }
 
 #[derive(Clone, Message)]
@@ -89,22 +89,6 @@ pub struct State {
     pub time_to_check_election_time_out: u64,
 }
 
-// todo
-// impl Default for State {
-//     fn default() -> State {
-//         let time_out_check_time = Instant::now().add(Self::random_timeout());
-//         State {
-//             commit_index: 0,
-//             last_applied: 0,
-//             voted_for: 0,
-//             role: Role::FOLLOWER,
-//             term: 0,
-//             logs: Vec::new(),
-//             time_to_check_election_time_out: time_out_check_time,
-//         }
-//     }
-// }
-
 impl State {
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
@@ -119,21 +103,17 @@ impl State {
     }
 
     // set check_election_time to now+random_timeout
-    pub fn update_check_time_out(&mut self) {
-        let start = SystemTime::now();
-        start.add(Self::random_timeout());
-        let since_the_epoch = start
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
-        let t = since_the_epoch.as_millis() as u64;
-        self.time_to_check_election_time_out = t;
+    pub fn update_election_check_time_out(&mut self) {
+        let start = system_time_now_epoch();
+        let check_time = start + Self::random_timeout().as_millis() as u64;
+        self.time_to_check_election_time_out = check_time;
     }
 
     pub fn get_role(&self) -> Role {
         match self.role {
             0 => Role::LEADER,
-            2 => Role::FOLLOWER,
-            1 => Role::CANDIDATOR,
+            1 => Role::FOLLOWER,
+            2 => Role::CANDIDATOR,
             _ => {
                 panic!("get role is not supported")
             }
@@ -185,38 +165,33 @@ impl Raft {
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
 
-        // todo
-        // crate::your_code_here((rf, apply_ch))
         rf
     }
 
     /// save Raft's persistent state to stable storage,
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
-    fn persist(&mut self) {
-        // Your code here (2C).
-        // Example:
-        // labcodec::encode(&self.xxx, &mut data).unwrap();
-        // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
-    }
+    // fn persist(&mut self) {
+    // Your code here (2C).
+    // Example:
+    // labcodec::encode(&self.xxx, &mut data).unwrap();
+    // labcodec::encode(&self.yyy, &mut data).unwrap();
+    // self.persister.save_raft_state(data);
+    // }
 
     /// restore previously persisted state.
     fn restore(&mut self, data: &[u8]) {
         if data.is_empty() {
-            // bootstrap without any state?
+            info!("raft persist is empty");
+            return;
         }
-        // Your code here (2C).
-        // Example:
-        // match labcodec::decode(data) {
-        //     Ok(o) => {
-        //         self.xxx = o.xxx;
-        //         self.yyy = o.yyy;
-        //     }
-        //     Err(e) => {
-        //         panic!("{:?}", e);
-        //     }
-        // }
+        let res = labcodec::decode::<State>(data);
+        match res {
+            Ok(o) => self.state = o,
+            Err(e) => {
+                panic!("failed to decode raft pesiste data: {:?}", e)
+            }
+        }
     }
 
     /// example code to send a RequestVote RPC to a server.
@@ -244,7 +219,6 @@ impl Raft {
     ) {
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
-        let id = self.me;
         peer.spawn(async move {
             let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
             if res.is_err() {
@@ -300,7 +274,6 @@ impl Raft {
         self.snapshot(0, &[]);
         // let a = channel();
         // let _ = self.send_request_vote(0, Default::default(), a.0);
-        self.persist();
         let _ = &self.state;
         let _ = &self.me;
         let _ = &self.persister;
@@ -310,9 +283,6 @@ impl Raft {
     pub fn get_state(&self) -> State {
         self.state.clone()
     }
-    // pub fn set_role(&mut self, role: Role) {
-    // self.role = role;
-    // }
 
     // index begin from 0 on start
     pub fn last_log_index(&self) -> usize {
@@ -326,7 +296,7 @@ impl Raft {
             Some(a) => a.term,
         }
     }
-    pub fn is_time_out(&self, time: u64) -> bool {
+    pub fn is_election_time_out(&self, time: u64) -> bool {
         self.state.time_to_check_election_time_out.eq(&time)
     }
 
@@ -389,7 +359,11 @@ impl RaftHandler {
     }
 
     fn main(mut self) {
-        self.raft.state.update_check_time_out();
+        // init state
+        self.raft.state.update_election_check_time_out();
+        // set role to follower
+        self.raft.state.role = 1;
+        // set up timer
         self.set_up_timeout_check_timer();
 
         loop {
@@ -424,6 +398,11 @@ impl RaftHandler {
                                 error!("recieved vote reply error {:?}", err);
                             }
                         },
+                        RaftEvent::ReadState(reply) => {
+                            reply
+                                .send(self.raft.get_state())
+                                .expect("send read state reply failed");
+                        }
                         _ => {
                             info!("main recieved others event,just ignore");
                         }
@@ -448,15 +427,16 @@ impl RaftHandler {
             );
             return;
         }
-        let is_time_out = self.raft.is_time_out(instant);
+        let is_time_out = self.raft.is_election_time_out(instant);
         if !is_time_out {
             return;
         }
         info!("time out ,start vote ");
         // update state
         let mut new_state = state.clone();
-        new_state.update_check_time_out();
+        new_state.update_election_check_time_out();
         new_state.set_role(Role::CANDIDATOR);
+        new_state.term = state.term + 1;
         self.raft.update_state_and_persist(new_state);
         self.set_up_timeout_check_timer();
         // send vote
@@ -472,14 +452,13 @@ impl RaftHandler {
             0
         };
 
-        // let time = check_time.clone();
         debug!("set next time out check after {} ms", duration);
         let tx = self.tx.clone();
         let _join = spawn(move || {
             thread::sleep(Duration::from_millis(duration));
             tx.send(RaftEvent::LeaderTimeOutCheck(check_time))
                 .expect("send time out check error");
-            info!("send time out check");
+            debug!("send time out check event");
         });
     }
 
@@ -660,25 +639,26 @@ fn system_time_now_epoch() -> u64 {
     let since_the_epoch = start
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards");
-    let t = since_the_epoch.as_millis() as u64;
-    t
+    since_the_epoch.as_millis() as u64
 }
 
 #[cfg(test)]
 pub mod my_tests {
     use std::{
-        panic, println, process,
+        panic, process,
         sync::Once,
         thread,
-        time::{self, Duration, Instant, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
         vec,
     };
 
-    use futures::channel::mpsc::{unbounded, UnboundedReceiver};
+    use futures::channel::mpsc::unbounded;
 
-    use crate::{proto::raftpb::RequestVoteReply, raft::State};
+    use crate::raft::{Role, State};
 
-    use super::{persister::SimplePersister, ApplyMsg, Node, Raft, RaftHandler};
+    use super::{
+        persister::SimplePersister, system_time_now_epoch, ApplyMsg, Node, Raft, RaftHandler,
+    };
 
     fn init_logger() {
         static LOGGER_INIT: Once = Once::new();
@@ -694,26 +674,34 @@ pub mod my_tests {
         }));
     }
 
-    fn create_raft_hander() -> RaftHandler {
+    fn create_node() -> Node {
         init_logger();
         crash_process_when_any_thread_panic();
         let p = SimplePersister::new();
         let (tx, _) = unbounded();
         let raft = Raft::new(vec![], 0, Box::new(p), tx);
-        let raft_handle = RaftHandler::new(raft);
-        raft_handle
+        Node::new(raft)
+    }
+    #[test]
+    fn test_update_check_time_out() {
+        let mut s = State::default();
+        let now = system_time_now_epoch();
+        s.update_election_check_time_out();
+        let t = s.time_to_check_election_time_out;
+        assert!(t - now >= 150);
+        assert!(t - now <= 300);
     }
 
-    #[test]
-    fn test_start() {
-        init_logger();
-        let p = SimplePersister::new();
-        let (tx, _) = unbounded();
-        let raft = Raft::new(vec![], 0, Box::new(p), tx);
-        let raft_handle = RaftHandler::new(raft);
-        raft_handle.start();
-        thread::sleep(Duration::from_millis(2000));
-    }
+    // #[test]
+    // fn test_start() {
+    //     init_logger();
+    //     let p = SimplePersister::new();
+    //     let (tx, _) = unbounded();
+    //     let raft = Raft::new(vec![], 0, Box::new(p), tx);
+    //     let raft_handle = RaftHandler::new(raft);
+    //     raft_handle.start();
+    //     thread::sleep(Duration::from_millis(2000));
+    // }
     #[test]
     fn test_rand_time_out() {
         for _ in 0..10 {
@@ -722,20 +710,35 @@ pub mod my_tests {
             assert!(res.as_millis() <= 300);
         }
     }
+    // #[test]
+    // fn debug_initial_election_2a() {
+    //     crash_process_when_any_thread_panic();
+    //     let servers = 3;
+
+    //     use crate::raft::config::Config;
+    //     let mut cfg = Config::new(servers);
+
+    //     cfg.begin("Test (2A): initial election");
+
+    //     loop {}
+    // }
     #[test]
-    fn debug_initial_election_2a() {
-        crash_process_when_any_thread_panic();
-        let servers = 3;
-
-        use crate::raft::config::Config;
-        let mut cfg = Config::new(servers);
-
-        cfg.begin("Test (2A): initial election");
-
-        loop {}
+    fn test_read_state() {
+        let node = create_node();
+        let stat = node.get_state();
+        assert_eq!(stat.get_role(), Role::FOLLOWER);
     }
     #[test]
-    fn test_follow_election_timeout() {}
+    fn test_follow_election_timeout() {
+        let node = create_node();
+        let stat = node.get_state();
+        assert_eq!(stat.get_role(), Role::FOLLOWER);
+        assert_eq!(stat.term(), 0);
+        thread::sleep(Duration::from_millis(350));
+        let stat = node.get_state();
+        assert_eq!(stat.get_role(), Role::CANDIDATOR);
+        assert_eq!(stat.term(), 1);
+    }
     #[test]
     fn test_follow_receive_vote() {}
     #[test]
