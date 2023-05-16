@@ -40,10 +40,10 @@ pub trait RpcHooks: Sync + Send + 'static {
 #[derive(Clone)]
 pub struct Client {
     // this end-point's name
-    pub(crate) name: String,
+    pub name: String,
     // copy of Network.sender
-    pub(crate) sender: UnboundedSender<Rpc>,
-    pub(crate) hooks: Arc<Mutex<Option<Arc<dyn RpcHooks>>>>,
+    pub sender: UnboundedSender<Rpc>,
+    pub hooks: Arc<Mutex<Option<Arc<dyn RpcHooks>>>>,
 
     pub worker: ThreadPool,
 }
