@@ -18,3 +18,16 @@ message RequestVoteReply {
     uint64 peer_id = 3;
     // Your data here (2A).
 }
+
+message AppendArgs {
+    uint64 leader_id = 1;
+    uint64 term = 2;
+    uint64 prev_log_index=3;
+    uint64 prev_log_term=4;
+    uint64 lead_commit =5;
+    repeated bytes entrys=6;
+}
+message AppendReply {
+    uint64 term = 1;
+    bool success = 2;
+}
