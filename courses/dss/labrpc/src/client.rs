@@ -5,6 +5,7 @@ use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot;
 use futures::executor::ThreadPool;
 use futures::future::{self, FutureExt};
+use log::{debug, error};
 
 use crate::error::{Error, Result};
 use crate::server::RpcFuture;
@@ -12,7 +13,7 @@ use crate::server::RpcFuture;
 pub struct Rpc {
     pub(crate) client_name: String,
     pub(crate) fq_name: &'static str,
-    pub(crate) req: Option<Vec<u8>>,
+    pub req: Option<Vec<u8>>,
     pub(crate) resp: Option<oneshot::Sender<Result<Vec<u8>>>>,
     pub(crate) hooks: Arc<Mutex<Option<Arc<dyn RpcHooks>>>>,
 }
@@ -68,10 +69,15 @@ impl Client {
             hooks: self.hooks.clone(),
         };
 
+        let res = self.sender.unbounded_send(rpc);
         // Sends requests and waits responses.
-        if self.sender.unbounded_send(rpc).is_err() {
+        if res.is_err() {
+            error!("errro {:?}", res);
             return Box::pin(future::err(Error::Stopped));
         }
+        // if self.sender.unbounded_send(rpc).is_err() {
+        // return Box::pin(future::err(Error::Stopped));
+        // }
 
         Box::pin(rx.then(|res| async move {
             match res {

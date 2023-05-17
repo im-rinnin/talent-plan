@@ -1,3 +1,5 @@
+use std::todo;
+
 use futures::channel::mpsc::unbounded;
 
 use crate::proto::kvraftpb::*;
@@ -86,9 +88,10 @@ impl Node {
 
     pub fn get_state(&self) -> raft::State {
         // Your code here.
-        raft::State {
-            ..Default::default()
-        }
+        todo!()
+        // raft::State {
+        // ..Default::default()
+        // }
     }
 }
 
