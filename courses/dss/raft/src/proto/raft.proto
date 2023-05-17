@@ -24,7 +24,7 @@ message AppendArgs {
     uint64 term = 2;
     uint64 prev_log_index=3;
     uint64 prev_log_term=4;
-    uint64 lead_commit =5;
+    uint64 leader_commit =5;
     repeated bytes entrys=6;
 }
 message AppendReply {

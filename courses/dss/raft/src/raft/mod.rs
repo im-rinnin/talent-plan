@@ -167,12 +167,18 @@ impl Raft {
         let raft_state = persister.raft_state();
         let (tx, rx) = crossbeam_channel::unbounded::<RaftEvent>();
 
+        let mut p = PersistentState::default();
+        p.logs.push(Entry {
+            data: vec![],
+            term: 0,
+        });
+
         // Your initialization code here (2A, 2B, 2C).
         let mut rf = Raft {
             peers,
             persister,
             me,
-            persistent_state: PersistentState::default(),
+            persistent_state: p,
             volatile_state: VolatileState::default(),
             rx: rx,
             tx: tx,
@@ -216,10 +222,11 @@ impl Raft {
                     return;
                 }
                 Ok(event) => match event {
-                    RaftEvent::LeaderTimeOutCheck(instant) => {
+                    RaftEvent::CheckElectionTimeOut(instant) => {
                         self.handle_election_timeout(instant);
                         self.set_up_election_timeout_checker();
                     }
+                    RaftEvent::HeartBeatTimeOut() => {}
                     RaftEvent::Vote(vote) => {
                         debug!("recv vote event");
                         self.handle_vote(&vote.request);
@@ -232,6 +239,10 @@ impl Raft {
                             warn!("recieved vote reply error {:?}", err);
                         }
                     },
+                    RaftEvent::Append(request, reply) => self.handle_append(request, reply),
+                    RaftEvent::AppendReply(reply) => {
+                        // just ignore todo
+                    }
                     RaftEvent::ReadState(reply) => {
                         reply
                             .send(State {
@@ -240,15 +251,7 @@ impl Raft {
                             })
                             .expect("send read state reply failed");
                     }
-                    RaftEvent::Append(request) => {
-                        todo!()
-                    }
-                    RaftEvent::AppendReply(reply) => {
-                        // just ignore
-                    }
-                    _ => {
-                        info!("main recieved others event,just ignore");
-                    }
+                    RaftEvent::Stop => {}
                 },
             }
         }
@@ -265,7 +268,7 @@ impl Raft {
         res
     }
 
-    fn run(mut self) -> Sender<RaftEvent> {
+    fn run(self) -> Sender<RaftEvent> {
         self.run_with_timer(true)
     }
 
@@ -317,10 +320,53 @@ impl Raft {
             self.volatile_state.vote_record.insert(reply.peer_id);
             if self.volatile_state.vote_record.len() > self.peers.len() / 2 + 1 {
                 self.become_leader();
+                self.save_persist_state();
                 self.send_heartbert_append();
             }
         }
     }
+    fn handle_append(&mut self, args: AppendArgs, reply_ch: oneshot::Sender<Result<AppendReply>>) {
+        // validate term
+        let reply = if args.term < self.persistent_state.term {
+            AppendReply {
+                term: self.persistent_state.term,
+                success: false,
+            }
+        } else {
+            // change role to follower
+            self.volatile_state.role = Role::FOLLOWER;
+            // update term
+            self.persistent_state.term = args.term;
+            // update election timeout
+            self.update_election_check_time_out();
+            // append/tructe log if match, or refuse log change
+            let logs = &mut self.persistent_state.logs;
+            if logs.len() < args.prev_log_index as usize {
+                info!("prev entry not found, refuse append")
+            } else if logs[args.prev_log_index as usize].term as u64 != args.term {
+                info!("prev entry not match,refuse append,index is {}, entry term is {}, args term is {}",args.prev_log_index, logs[args.prev_log_index as usize].term ,args.term)
+            } else {
+                while logs.len() > args.prev_log_index as usize {
+                    logs.pop();
+                }
+                for data in args.entrys {
+                    let entry = labcodec::decode::<Entry>(&data).expect("decode entry error");
+                    logs.push(entry);
+                }
+            }
+            self.save_persist_state();
+            AppendReply {
+                term: self.persistent_state.term,
+                success: true,
+            }
+        };
+
+        reply_ch
+            .send(Ok(reply))
+            .expect("send append reply to chan failed");
+    }
+    fn change_state(&mut self, args: AppendArgs) {}
+    fn append_date(&mut self, args: AppendArgs) {}
 
     fn become_leader(&mut self) {
         info!("get votes from majority ,become leader");
@@ -353,7 +399,7 @@ impl Raft {
         let tx = self.tx.clone();
         let _join = spawn(move || {
             thread::sleep(Duration::from_millis(duration));
-            tx.send(RaftEvent::LeaderTimeOutCheck(check_time))
+            tx.send(RaftEvent::CheckElectionTimeOut(check_time))
                 .expect("send time out check error");
             debug!("send time out check event");
         });
@@ -386,7 +432,7 @@ impl Raft {
                 term: self.persistent_state.term,
                 prev_log_index: self.prev_log_index(peer_id),
                 prev_log_term: self.prev_log_term(peer_id),
-                lead_commit: self.volatile_state.commit_index,
+                leader_commit: self.volatile_state.commit_index,
                 entrys: vec![],
             };
             debug!("send append request to peer {}", peer_id);
@@ -533,7 +579,7 @@ impl Raft {
 
     // index begin from 0 on start
     pub fn last_log_index(&self) -> usize {
-        self.persistent_state.logs.len()
+        self.persistent_state.logs.len() - 1
     }
     // term begin from 0 on start
     pub fn last_log_term(&self) -> u64 {
@@ -571,15 +617,18 @@ struct VoteRequestEvent {
 enum RequestEvent {
     Vote(VoteRequestEvent),
 }
+// |election 超时|heartbeat timeout|append|append apply|vote|vote apply|
 #[derive(Debug)]
 enum RaftEvent {
-    LeaderTimeOutCheck(u64),
-    ReadState(Sender<State>),
+    CheckElectionTimeOut(u64),
+    HeartBeatTimeOut(),
+    Append(AppendArgs, oneshot::Sender<Result<AppendReply>>),
+    AppendReply(Result<AppendReply>),
     VoteReply(Result<RequestVoteReply>),
     Vote(VoteRequestEvent),
-    Append(AppendArgs),
-    AppendReply(Result<AppendReply>),
+
     Stop,
+    ReadState(Sender<State>),
 }
 
 // Choose concurrency paradigm.
@@ -726,7 +775,6 @@ impl RaftService for Node {
         guard
             .send(RaftEvent::Vote(vote_event))
             .expect("send vote request failed");
-        drop(guard);
 
         let t = rx.await;
         match t {
@@ -738,7 +786,26 @@ impl RaftService for Node {
         }
     }
     async fn append(&self, args: AppendArgs) -> labrpc::Result<AppendReply> {
-        todo!()
+        {
+            // Your code here (2A, 2B).
+            // crate::your_code_here(args)
+            info!("receive append from peer {}", args.leader_id);
+            let (tx, rx) = oneshot::channel();
+            let append_event = RaftEvent::Append(args, tx);
+            let guard = self.tx.lock().await;
+            guard
+                .send(append_event)
+                .expect("send append request failed");
+
+            let t = rx.await;
+            match t {
+                Ok(res) => match res {
+                    Ok(r) => labrpc::Result::Ok(r),
+                    Err(e) => labrpc::Result::Err(labrpc::Error::Other(e.to_string())),
+                },
+                Err(e) => labrpc::Result::Err(labrpc::Error::Other(e.to_string())),
+            }
+        }
     }
 }
 
@@ -763,7 +830,10 @@ pub mod my_tests {
     };
 
     use futures::{
-        channel::mpsc::{channel, unbounded, UnboundedReceiver},
+        channel::{
+            mpsc::{channel, unbounded, UnboundedReceiver},
+            oneshot,
+        },
         executor::{block_on, ThreadPool},
         FutureExt, SinkExt, StreamExt,
     };
@@ -847,6 +917,7 @@ pub mod my_tests {
         assert!(state.v_state.time_to_check_election_time_out - now > 140);
         assert!(state.v_state.time_to_check_election_time_out - now <= 300);
     }
+    // []超时开始选举
     #[test]
     fn test_election_timeout() {
         let (c, rx) = create_raft_client("test");
@@ -861,39 +932,35 @@ pub mod my_tests {
         assert_eq!(state.p_state.term, 0);
         let time = state.v_state.time_to_check_election_time_out;
 
-        n.send_event(RaftEvent::LeaderTimeOutCheck(time));
+        // 超时
+        n.send_event(RaftEvent::CheckElectionTimeOut(time));
+        // assert vote
         let (reply, rx) = get_send_rpc::<RequestVoteArgs>(rx);
         assert_eq!(reply.peer_id, me as u64);
         assert_eq!(reply.term, new_term);
         assert_eq!(reply.last_log_index, 0);
         assert_eq!(reply.last_log_term, 0);
 
+        // assert state
         let state = n.get_state();
 
         assert_eq!(state.v_state.role, Role::CANDIDATOR);
         assert_eq!(state.p_state.term, new_term);
         assert_eq!(state.v_state.vote_record.len(), 1);
         assert!(state.v_state.time_to_check_election_time_out != time);
-
         assert!(state.v_state.vote_record.get(&(me as u64)).is_some());
     }
     #[test]
 
+    // 选举成功，发送心跳
     fn test_election_success() {
         let (c, rx) = create_raft_client("test");
         let me = 1;
         let new_term = 1;
 
-        let r = create_raft_with_client(vec![c], me);
+        let mut r = create_raft_with_client(vec![c], me);
+        r.becomes_candidate();
         let n = Node::new_disable_timer(r);
-
-        let state = n.get_state();
-        assert_eq!(state.v_state.role, Role::FOLLOWER);
-        assert_eq!(state.p_state.term, 0);
-
-        let time = state.v_state.time_to_check_election_time_out;
-        n.send_event(RaftEvent::LeaderTimeOutCheck(time));
-        let (_, rx) = get_send_rpc::<RequestVoteArgs>(rx);
 
         n.send_event(RaftEvent::VoteReply(Ok(RequestVoteReply {
             term: new_term,
@@ -906,83 +973,64 @@ pub mod my_tests {
         assert_eq!(reply.leader_id, me as u64);
         assert_eq!(reply.prev_log_index, 0);
         assert_eq!(reply.prev_log_term, 0);
-        assert_eq!(reply.lead_commit, 0);
+        assert_eq!(reply.leader_commit, 0);
         let state = n.get_state();
         assert_eq!(state.v_state.role, Role::LEADER);
     }
     // election vote timeout, no node elect successfull
+    // 选举失败，没有达到半数，继续下一轮
     #[test]
-    fn test_election_no_winnner() {}
-    // #[test]
-    // fn test_become_follower() {
-    // let mut s = State::default();
-    // s.init_state();
-    //
-    // let new_term = 3;
-    // s.becomes_follower(new_term, 1);
-    // assert!(s.get_role() == Role::FOLLOWER);
-    // assert!(s.voted_for == 1);
-    //
-    // let now = system_time_now_epoch();
-    // assert!(s.time_to_check_election_time_out - now > ELECTION_TIMEOUT_MIN_TIME - 5);
-    // assert!(
-    // s.time_to_check_election_time_out - now
-    // < ELECTION_TIMEOUT_MIN_TIME + ELECTION_TIMEOUT_RANGE - 5
-    // );
-    // }
-    // #[test]
-    // fn test_read_state() {
-    // let node = create_node();
-    // let stat = node.get_persistent_state();
-    // assert_eq!(stat.get_role(), Role::FOLLOWER);
-    // }
-    // #[test]
-    // fn test_follow_election() {
-    // let node = create_node();
-    // let stat = node.get_persistent_state();
-    // assert_eq!(stat.get_role(), Role::FOLLOWER);
-    // assert_eq!(stat.term(), 0);
-    // thread::sleep(Duration::from_millis(350));
-    // let stat = node.get_persistent_state();
-    // assert_eq!(stat.get_role(), Role::CANDIDATOR);
-    // assert_eq!(stat.term(), 1);
-    // }
-    // todo
-    // #[test]
-    // fn test_election_win() {
-    //     init_logger();
-    //     crash_process_when_any_thread_panic();
-    //     let p = SimplePersister::new();
-    //     let (tx, _) = unbounded();
-    //     Raft::new(vec![create_client(), create_client()], 0, Box::new(p), tx);
-    //     let mut raft = create_raft();
-    //     raft.disable_requests();
-    //     let mut s = raft.state.clone();
-    //     s.becomes_candidate();
-    //     raft.set_state(s);
+    fn test_election_no_winnner() {
+        let (c, rx) = create_raft_client("test");
+        let me = 1;
 
-    //     let node = Node::new(raft);
-    //     let tx_lock = node.tx.clone();
-    //     let tx = block_on(tx_lock.lock());
-    //     tx.send(super::RaftEvent::VoteReply(Ok(RequestVoteReply {
-    //         term: 1,
-    //         vote_granted: true,
-    //         peer_id: 0,
-    //     })))
-    //     .unwrap();
-    //     tx.send(super::RaftEvent::VoteReply(Ok(RequestVoteReply {
-    //         term: 1,
-    //         vote_granted: true,
-    //         peer_id: 1,
-    //     })))
-    //     .unwrap();
+        let mut r = create_raft_with_client(vec![c], me);
+        r.becomes_candidate();
+        let n = Node::new(r);
+        let state = n.get_state();
+        assert_eq!(state.v_state.role, Role::CANDIDATOR);
+        let old_term = state.p_state.term;
 
-    //     let s = node.get_state();
-
-    //     assert!(s.is_leader())
-    // }
+        // sleep after  election timeout
+        thread::sleep(Duration::from_millis(320));
+        let state = n.get_state();
+        let role = state.v_state.role;
+        assert_eq!(role, Role::CANDIDATOR);
+        assert_eq!(state.p_state.term, old_term + 1);
+        let (reply) = get_send_rpc::<RequestVoteArgs>(rx);
+    }
+    // 选举失败，其他节点成功
     #[test]
-    fn test_election_fail() {}
+    fn test_election_but_fail() {
+        let (c, rx) = create_raft_client("test");
+        let me = 3;
+
+        let mut r = create_raft_with_client(vec![c], me);
+        r.becomes_candidate();
+        let n = Node::new(r);
+        let state = n.get_state();
+        let term = state.p_state.term;
+        let old_check_time = state.v_state.time_to_check_election_time_out;
+
+        let (tx, rx) = oneshot::channel();
+
+        n.send_event(RaftEvent::Append(
+            AppendArgs {
+                leader_id: 0,
+                term: term,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                leader_commit: 0,
+                entrys: vec![],
+            },
+            tx,
+        ));
+
+        let state = n.get_state();
+        assert_eq!(state.p_state.term, term);
+        assert_eq!(state.v_state.role, Role::FOLLOWER);
+        assert!(state.v_state.time_to_check_election_time_out != old_check_time);
+    }
 
     #[test]
     fn test_follow_receive_append() {}
