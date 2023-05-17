@@ -295,6 +295,7 @@ impl Raft {
         self.send_vote(self.persistent_state.term);
     }
     fn handle_vote(&mut self, vote: &RequestVoteArgs) -> RequestVoteReply {
+        todo!();
         return if vote.term < self.persistent_state.term {
             RequestVoteReply {
                 peer_id: self.me as u64,
