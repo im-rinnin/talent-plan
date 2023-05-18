@@ -91,6 +91,7 @@ pub struct VolatileState {
     next_index: HashMap<u64, u64>,
     match_index: HashMap<u64, u64>,
     vote_record: HashSet<u64>,
+    last_send_append_time: u64,
     // update to current_time+random_time[150,300)
     // when to update:
     // init
@@ -107,6 +108,7 @@ impl Default for VolatileState {
             next_index: Default::default(),
             match_index: Default::default(),
             time_to_check_election_time_out: Default::default(),
+            last_send_append_time: 0,
             vote_record: Default::default(),
         }
     }
@@ -209,7 +211,6 @@ impl Raft {
     }
 
     fn main(mut self) {
-        self.update_election_check_time_out();
 
         loop {
             //
@@ -223,9 +224,10 @@ impl Raft {
                 Ok(event) => match event {
                     RaftEvent::CheckElectionTimeOut(instant) => {
                         self.handle_election_timeout(instant);
-                        self.set_up_election_timeout_checker();
                     }
-                    RaftEvent::HeartBeatTimeOut() => {}
+                    RaftEvent::HeartBeatTimeOut() => {
+                        self.handle_heartbeat_event();
+                    }
                     RaftEvent::Vote(vote) => {
                         debug!("recv vote event");
                         self.handle_vote(&vote.request);
@@ -258,10 +260,11 @@ impl Raft {
     // disable timer for test
     fn run_with_timer(mut self, enable_timer: bool) -> Sender<RaftEvent> {
         let res = self.tx.clone();
+        self.update_election_check_time_out();
         if enable_timer {
             // set up timer
             self.set_up_election_timeout_checker();
-            //  todo set up heartbeat timer
+            self.set_up_heartbeat_timer();
         }
         let _ = thread::spawn(move || self.main());
         res
@@ -291,7 +294,11 @@ impl Raft {
     }
 
     fn handle_election_timeout(&mut self, instant: u64) {
+        // self.set_up_election_timeout_checker();
         if self.volatile_state.time_to_check_election_time_out != instant {
+            return;
+        }
+        if self.volatile_state.role == Role::LEADER {
             return;
         }
         info!("{} elclection timeout,start election", self.me);
@@ -355,7 +362,6 @@ impl Raft {
                 for data in args.entrys {
                     let entry = labcodec::decode::<Entry>(&data).expect("decode entry error");
                     logs.push(entry);
-                    debug!("append entry");
                 }
             }
             self.save_persist_state();
@@ -368,6 +374,18 @@ impl Raft {
         reply_ch
             .send(Ok(reply))
             .expect("send append reply to chan failed");
+    }
+
+    fn handle_heartbeat_event(&mut self) {
+        if self.volatile_state.role != Role::LEADER {
+            return;
+        }
+        // check last append send
+        let now = system_time_now_epoch();
+        if now - self.volatile_state.last_send_append_time >= HEARTBEAT_CHECK_INTERVAL {
+            self.send_heartbert_append();
+            self.volatile_state.last_send_append_time = now;
+        }
     }
     fn change_state(&mut self, args: AppendArgs) {}
     fn append_date(&mut self, args: AppendArgs) {}
@@ -383,11 +401,18 @@ impl Raft {
                 .insert(id as u64, (self.last_log_index() + 1) as u64);
             self.volatile_state.match_index.insert(id as u64, 0);
         }
+        self.volatile_state.last_send_append_time = system_time_now_epoch();
     }
     fn set_up_heartbeat_timer(&mut self) {
         // set up a timer
         // send a heartbeat check event
         // check if need to send a heartbeat in constant time interval
+        let tx = self.tx.clone();
+        spawn(move || loop {
+            thread::sleep(Duration::from_millis(HEARTBEAT_CHECK_INTERVAL));
+            tx.send(RaftEvent::HeartBeatTimeOut())
+                .expect("send heartbeat check event error");
+        });
     }
 
     fn set_up_election_timeout_checker(&mut self) {
@@ -1141,8 +1166,40 @@ pub mod my_tests {
         let entry = logs.get(2).unwrap();
         assert_eq!(entry.data, store_data);
     }
+    // leader 超时心跳发送
     #[test]
-    fn test_candidate_timeout() {}
+    fn test_send_heartbeat() {
+        let (c, rx) = create_raft_client("test");
+        let me = 3;
+
+        let mut r = create_raft_with_client(vec![c], me);
+        let term = 1;
+        let state = &mut r.persistent_state;
+        state.term = term;
+        r.become_leader();
+        let n = Node::new(r);
+        // sleep and check heartbeat
+
+        thread::sleep(Duration::from_millis(HEARTBEAT_CHECK_INTERVAL + 10));
+        let (append, rx) = get_send_rpc::<AppendArgs>(rx);
+
+        assert_eq!(append.entrys.len(), 0);
+        assert_eq!(append.leader_id, 3);
+        assert_eq!(append.term, term);
+    }
+    #[test]
+    #[ignore]
+    fn test_commited_index_update() {
+        let (c1, rx_1) = create_raft_client("test");
+        let (c2, rx_2) = create_raft_client("test");
+        let me = 3;
+
+        let mut r = create_raft_with_client(vec![c1, c2], me);
+        let term = 1;
+        r.become_leader();
+        let n = Node::new_disable_timer(r);
+        // todo append meg
+    }
     #[test]
     fn debug() {
         let (c, rx) = create_raft_client("test");
