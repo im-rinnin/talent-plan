@@ -31,3 +31,6 @@ message AppendReply {
     uint64 term = 1;
     bool success = 2;
 }
+message MessageForTest {
+    uint64 data=1;
+}

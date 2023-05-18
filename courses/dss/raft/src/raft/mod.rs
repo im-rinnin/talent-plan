@@ -13,6 +13,7 @@ use prost::Message;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::default;
+use std::f32::consts::E;
 use std::ops::Add;
 use std::sync::Arc;
 use std::thread;
@@ -211,7 +212,6 @@ impl Raft {
     }
 
     fn main(mut self) {
-
         loop {
             //
             let res = self.rx.recv();
@@ -253,6 +253,7 @@ impl Raft {
                             .expect("send read state reply failed");
                     }
                     RaftEvent::Stop => {}
+                    RaftEvent::ClientCommand { data, reply } => self.handle_command(data, reply),
                 },
             }
         }
@@ -310,7 +311,6 @@ impl Raft {
         self.send_vote(self.persistent_state.term);
     }
     fn handle_vote(&mut self, vote: &RequestVoteArgs) -> RequestVoteReply {
-        todo!();
         return if vote.term < self.persistent_state.term {
             RequestVoteReply {
                 peer_id: self.me as u64,
@@ -333,7 +333,7 @@ impl Raft {
             if self.volatile_state.vote_record.len() > self.peers.len() / 2 + 1 {
                 self.become_leader();
                 self.save_persist_state();
-                self.send_heartbert_append();
+                self.send_append_to_all_client();
             }
         }
     }
@@ -375,6 +375,33 @@ impl Raft {
             .send(Ok(reply))
             .expect("send append reply to chan failed");
     }
+    fn handle_command(&mut self, data: Vec<u8>, reply: oneshot::Sender<ClientCommandReply>) {
+        if self.volatile_state.role != Role::LEADER {
+            reply
+                .send(ClientCommandReply {
+                    success: false,
+                    index: 0,
+                    term: 0,
+                })
+                .expect("send command reply error");
+        } else {
+            let entry = Entry {
+                data,
+                term: self.persistent_state.term,
+            };
+            self.persistent_state.logs.push(entry);
+            self.send_append_to_all_client();
+            self.volatile_state.last_send_append_time = system_time_now_epoch();
+
+            reply
+                .send(ClientCommandReply {
+                    success: true,
+                    index: (self.persistent_state.logs.len() - 1) as u64,
+                    term: self.persistent_state.term,
+                })
+                .expect("send command reply error");
+        }
+    }
 
     fn handle_heartbeat_event(&mut self) {
         if self.volatile_state.role != Role::LEADER {
@@ -383,12 +410,10 @@ impl Raft {
         // check last append send
         let now = system_time_now_epoch();
         if now - self.volatile_state.last_send_append_time >= HEARTBEAT_CHECK_INTERVAL {
-            self.send_heartbert_append();
+            self.send_append_to_all_client();
             self.volatile_state.last_send_append_time = now;
         }
     }
-    fn change_state(&mut self, args: AppendArgs) {}
-    fn append_date(&mut self, args: AppendArgs) {}
 
     fn become_leader(&mut self) {
         info!("get votes from majority ,become leader");
@@ -451,18 +476,34 @@ impl Raft {
         return entry.term;
     }
 
-    fn send_heartbert_append(&mut self) {
+    fn send_append_to_all_client(&mut self) {
         for (peer_id, c) in self.peers.iter().enumerate() {
             if peer_id == self.me {
                 continue;
             }
+            let match_index = self
+                .volatile_state
+                .match_index
+                .get(&(peer_id as u64))
+                .expect("get match index fail");
+
+            assert!(*match_index < self.persistent_state.logs.len() as u64);
+
+            let mut entrys = vec![];
+            for i in (*match_index as usize + 1)..self.persistent_state.logs.len() {
+                let mut data = vec![];
+                let entry = self.persistent_state.logs.get(i).unwrap();
+                labcodec::encode(entry, &mut data).expect("encode entry fail");
+                entrys.push(data);
+            }
+
             let append_request = AppendArgs {
                 leader_id: self.me as u64,
                 term: self.persistent_state.term,
                 prev_log_index: self.prev_log_index(peer_id),
                 prev_log_term: self.prev_log_term(peer_id),
                 leader_commit: self.volatile_state.commit_index,
-                entrys: vec![],
+                entrys,
             };
             debug!("send append request to peer {}", peer_id);
             let c_clone = c.clone();
@@ -646,6 +687,13 @@ struct VoteRequestEvent {
 enum RequestEvent {
     Vote(VoteRequestEvent),
 }
+#[derive(Clone, Debug)]
+struct ClientCommandReply {
+    success: bool,
+    index: u64,
+    term: u64,
+}
+
 // |election 超时|heartbeat timeout|append|append apply|vote|vote apply|
 #[derive(Debug)]
 enum RaftEvent {
@@ -658,6 +706,11 @@ enum RaftEvent {
 
     Stop,
     ReadState(Sender<State>),
+
+    ClientCommand {
+        data: Vec<u8>,
+        reply: oneshot::Sender<ClientCommandReply>,
+    },
 }
 
 // Choose concurrency paradigm.
@@ -719,7 +772,34 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.start(command)
-        crate::your_code_here(command)
+
+        let mut data = vec![];
+        command.encode(&mut data);
+        let (tx, rx) = oneshot::channel();
+
+        block_on(async {
+            let g = self.tx.lock().await;
+            let res = g.send_timeout(
+                RaftEvent::ClientCommand {
+                    data: data,
+                    reply: tx,
+                },
+                Duration::from_millis(10),
+            );
+            res.expect("send client timeout ");
+        });
+
+        let res = block_on(async {
+            let receive_res = rx.await;
+            let res = receive_res.expect("receive client command error");
+            res
+        });
+        if res.success {
+            debug!("log is {:?}", res.index);
+            Ok((res.index, res.term))
+        } else {
+            Err(Error::NotLeader)
+        }
     }
 
     /// The current term of this peer.
@@ -1081,7 +1161,7 @@ pub mod my_tests {
             term: term,
         };
         let mut data = Vec::new();
-        labcodec::encode(&e, &mut data);
+        labcodec::encode(&e, &mut data).unwrap();
 
         // append two entries in two append requeset
         let append_request = AppendArgs {
@@ -1186,6 +1266,38 @@ pub mod my_tests {
         assert_eq!(append.entrys.len(), 0);
         assert_eq!(append.leader_id, 3);
         assert_eq!(append.term, term);
+    }
+    #[test]
+    fn test_client_command_success() {
+        let (c, rx) = create_raft_client("test");
+        let me = 1;
+        let mut r = create_raft_with_client(vec![c], me);
+        // leader start in 1
+        r.persistent_state.term = 1;
+        r.become_leader();
+        let node = Node::new_disable_timer(r);
+
+        let command = MessageForTest { data: 1 };
+
+        let res = node.start(&command);
+        assert!(res.is_ok());
+        let r = res.unwrap();
+        assert_eq!(r.0, 1);
+        assert_eq!(r.1, 1);
+    }
+
+    #[test]
+    fn test_client_command_to_non_leader() {
+        let (c, rx) = create_raft_client("test");
+        let me = 1;
+        let mut r = create_raft_with_client(vec![c], me);
+        r.becomes_candidate();
+        let node = Node::new_disable_timer(r);
+
+        let command = MessageForTest { data: 1 };
+
+        let res = node.start(&command);
+        assert!(res.is_err());
     }
     #[test]
     #[ignore]
