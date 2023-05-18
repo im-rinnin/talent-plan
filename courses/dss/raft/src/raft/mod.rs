@@ -1,7 +1,6 @@
 use core::panic;
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
-use futures::channel;
 use futures::channel::mpsc::unbounded;
 use futures::channel::oneshot;
 use futures::channel::oneshot::channel;
@@ -281,8 +280,14 @@ impl Raft {
         self.update_election_check_time_out();
     }
 
-    fn becomes_follower(&mut self, term: u64, vote_for: u64) {
-        todo!()
+    fn becomes_follower(&mut self, term: u64, vote_for: Option<u64>) {
+        // change role to follower
+        self.volatile_state.role = Role::FOLLOWER;
+        // update term
+        self.persistent_state.term = term;
+        self.persistent_state.voted_for = vote_for;
+        // update election timeout
+        self.update_election_check_time_out();
     }
 
     fn handle_election_timeout(&mut self, instant: u64) {
@@ -333,31 +338,30 @@ impl Raft {
                 success: false,
             }
         } else {
-            // change role to follower
-            self.volatile_state.role = Role::FOLLOWER;
-            // update term
-            self.persistent_state.term = args.term;
-            // update election timeout
-            self.update_election_check_time_out();
+            self.becomes_follower(args.term, None);
+            let mut accept = false;
+
             // append/tructe log if match, or refuse log change
             let logs = &mut self.persistent_state.logs;
             if logs.len() < args.prev_log_index as usize {
                 info!("prev entry not found, refuse append")
-            } else if logs[args.prev_log_index as usize].term as u64 != args.term {
-                info!("prev entry not match,refuse append,index is {}, entry term is {}, args term is {}",args.prev_log_index, logs[args.prev_log_index as usize].term ,args.term)
+            } else if logs[args.prev_log_index as usize].term as u64 != args.prev_log_term {
+                info!("prev entry not match,refuse append,index is {}, entry term is {}, args prev log term is {}",args.prev_log_index, logs[args.prev_log_index as usize].term ,args.term)
             } else {
-                while logs.len() > args.prev_log_index as usize {
+                accept = true;
+                while logs.len() - 1 > args.prev_log_index as usize {
                     logs.pop();
                 }
                 for data in args.entrys {
                     let entry = labcodec::decode::<Entry>(&data).expect("decode entry error");
                     logs.push(entry);
+                    debug!("append entry");
                 }
             }
             self.save_persist_state();
             AppendReply {
                 term: self.persistent_state.term,
-                success: true,
+                success: accept,
             }
         };
 
@@ -835,12 +839,14 @@ pub mod my_tests {
             oneshot,
         },
         executor::{block_on, ThreadPool},
-        FutureExt, SinkExt, StreamExt,
+        FutureExt, SinkExt, StreamExt, TryFutureExt,
     };
     use labcodec::Message;
     use labrpc::{Client, Rpc};
 
-    use super::{persister::SimplePersister, system_time_now_epoch, Node, PersistentState, Raft};
+    use super::{
+        persister::SimplePersister, system_time_now_epoch, Entry, Node, PersistentState, Raft,
+    };
     use crate::{proto::raftpb::*, raft::HEARTBEAT_CHECK_INTERVAL};
     use crate::{
         proto::{kvraftpb::GetReply, raftpb::RequestVoteReply},
@@ -997,7 +1003,7 @@ pub mod my_tests {
         let role = state.v_state.role;
         assert_eq!(role, Role::CANDIDATOR);
         assert_eq!(state.p_state.term, old_term + 1);
-        let (reply) = get_send_rpc::<RequestVoteArgs>(rx);
+        let (_reply) = get_send_rpc::<RequestVoteArgs>(rx);
     }
     // 选举失败，其他节点成功
     #[test]
@@ -1012,7 +1018,7 @@ pub mod my_tests {
         let term = state.p_state.term;
         let old_check_time = state.v_state.time_to_check_election_time_out;
 
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel::<super::Result<AppendReply>>();
 
         n.send_event(RaftEvent::Append(
             AppendArgs {
@@ -1033,7 +1039,108 @@ pub mod my_tests {
     }
 
     #[test]
-    fn test_follow_receive_append() {}
+    fn test_receive_append() {
+        let (c, rx) = create_raft_client("test");
+        let me = 3;
+
+        let mut r = create_raft_with_client(vec![c], me);
+        let term = 1;
+        let leader_id = 1;
+        r.becomes_follower(term, None);
+        let n = Node::new_disable_timer(r);
+        let store_data = vec![1, 2, 3];
+
+        // [x] append 接受term
+        let e = Entry {
+            data: store_data.clone(),
+            term: term,
+        };
+        let mut data = Vec::new();
+        labcodec::encode(&e, &mut data);
+
+        // append two entries in two append requeset
+        let append_request = AppendArgs {
+            leader_id,
+            term,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: leader_id,
+            entrys: vec![data],
+        };
+        let (tx, rx) = oneshot::channel::<super::Result<AppendReply>>();
+        n.send_event(RaftEvent::Append(append_request, tx));
+        // let reply = block_on(async { rx.into_future().await }).unwrap();
+
+        let state = n.get_state();
+        let log = &state.p_state.logs;
+
+        assert_eq!(log.len(), 2);
+
+        let append_e = log.get(1).unwrap();
+        assert_eq!(&e.term, &term);
+        assert_eq!(&e.data, &store_data);
+
+        // [x]失败，term不符合当前
+        let append_request = AppendArgs {
+            leader_id,
+            term: term - 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: leader_id,
+            entrys: vec![],
+        };
+
+        let (tx, mut rx) = oneshot::channel::<super::Result<AppendReply>>();
+        n.send_event(RaftEvent::Append(append_request, tx));
+
+        let res = block_on(async { rx.await }).unwrap().unwrap();
+        assert_eq!(res.success, false);
+        assert_eq!(res.term, term);
+
+        // 拒绝，prex不符合
+        let append_request = AppendArgs {
+            leader_id,
+            term: term,
+            prev_log_index: 0,
+            prev_log_term: 1,
+            leader_commit: leader_id,
+            entrys: vec![],
+        };
+        let (tx, mut rx) = oneshot::channel::<super::Result<AppendReply>>();
+        n.send_event(RaftEvent::Append(append_request, tx));
+
+        let res = block_on(async { rx.await }).unwrap().unwrap();
+        assert_eq!(res.success, false);
+        assert_eq!(res.term, term);
+        // append 截断 follower
+        let e = Entry {
+            data: store_data.clone(),
+            term: term,
+        };
+        let mut data = Vec::new();
+        labcodec::encode(&e, &mut data).unwrap();
+        let entrys = vec![data.clone(), data];
+
+        let append_request = AppendArgs {
+            leader_id,
+            term: term,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: leader_id,
+            entrys,
+        };
+        let (tx, mut rx) = oneshot::channel::<super::Result<AppendReply>>();
+        n.send_event(RaftEvent::Append(append_request, tx));
+        let res = block_on(async { rx.await }).unwrap().unwrap();
+        assert_eq!(res.success, true);
+        assert_eq!(res.term, term);
+
+        let state = n.get_state();
+        let logs = &state.p_state.logs;
+        assert_eq!(logs.len(), 3);
+        let entry = logs.get(2).unwrap();
+        assert_eq!(entry.data, store_data);
+    }
     #[test]
     fn test_candidate_timeout() {}
     #[test]
