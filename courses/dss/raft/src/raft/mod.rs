@@ -232,17 +232,12 @@ impl Raft {
                         debug!("recv vote event");
                         self.handle_vote(&vote.request);
                     }
-                    RaftEvent::VoteReply(reply_result) => match reply_result {
-                        Ok(reply) => {
-                            self.handle_vote_reply(reply);
-                        }
-                        Err(err) => {
-                            warn!("recieved vote reply error {:?}", err);
-                        }
-                    },
+                    RaftEvent::VoteReply(reply_result) => {
+                        self.handle_vote_reply(reply_result);
+                    }
                     RaftEvent::Append(request, reply) => self.handle_append(request, reply),
-                    RaftEvent::AppendReply(reply) => {
-                        // just ignore todo
+                    RaftEvent::AppendReply { reply, peer_id } => {
+                        self.handle_append_reply(reply, peer_id);
                     }
                     RaftEvent::ReadState(reply) => {
                         reply
@@ -337,12 +332,51 @@ impl Raft {
             }
         }
     }
+    fn handle_append_reply(&mut self, reply: AppendReply, peer_id: u64) {
+        // validate reply
+        if self.volatile_state.role != Role::LEADER {
+            info!("receive append reply but current role is not leader,ignore");
+            return;
+        }
+        if reply.term < self.persistent_state.term {
+            return;
+        } else if reply.term == self.persistent_state.term {
+            if reply.success {
+                // update next_index
+                let next_index = self.volatile_state.next_index.get_mut(&peer_id).unwrap();
+                *next_index = reply.match_index + 1;
+                let match_index = self.volatile_state.match_index.get_mut(&peer_id).unwrap();
+                *match_index = reply.match_index;
+                //  update commit index
+                let mut match_indexs = vec![(self.persistent_state.logs.len() - 1) as u64];
+                for (_, index) in &self.volatile_state.match_index {
+                    match_indexs.push(*index);
+                }
+                match_indexs.sort();
+                let n = match_indexs.get(match_indexs.len() / 2 + 1).unwrap();
+                if *n > self.volatile_state.commit_index {
+                    info!("update committed index to {}", *n);
+                    self.volatile_state.commit_index = *n;
+                }
+            } else {
+                // decrease next_index
+                let i = self.volatile_state.next_index.get_mut(&peer_id).unwrap();
+                *i = *i - 1;
+                // resend append
+                self.send_append_to(peer_id as usize, self.peers.get(peer_id as usize).unwrap());
+            }
+        } else {
+            self.becomes_follower(reply.term, None);
+        }
+    }
+
     fn handle_append(&mut self, args: AppendArgs, reply_ch: oneshot::Sender<Result<AppendReply>>) {
         // validate term
         let reply = if args.term < self.persistent_state.term {
             AppendReply {
                 term: self.persistent_state.term,
                 success: false,
+                match_index: 0,
             }
         } else {
             self.becomes_follower(args.term, None);
@@ -368,6 +402,7 @@ impl Raft {
             AppendReply {
                 term: self.persistent_state.term,
                 success: accept,
+                match_index: (self.persistent_state.logs.len() - 1) as u64,
             }
         };
 
@@ -481,46 +516,56 @@ impl Raft {
             if peer_id == self.me {
                 continue;
             }
-            let match_index = self
-                .volatile_state
-                .match_index
-                .get(&(peer_id as u64))
-                .expect("get match index fail");
-
-            assert!(*match_index < self.persistent_state.logs.len() as u64);
-
-            let mut entrys = vec![];
-            for i in (*match_index as usize + 1)..self.persistent_state.logs.len() {
-                let mut data = vec![];
-                let entry = self.persistent_state.logs.get(i).unwrap();
-                labcodec::encode(entry, &mut data).expect("encode entry fail");
-                entrys.push(data);
-            }
-
-            let append_request = AppendArgs {
-                leader_id: self.me as u64,
-                term: self.persistent_state.term,
-                prev_log_index: self.prev_log_index(peer_id),
-                prev_log_term: self.prev_log_term(peer_id),
-                leader_commit: self.volatile_state.commit_index,
-                entrys,
-            };
-            debug!("send append request to peer {}", peer_id);
-            let c_clone = c.clone();
-            let tx = self.tx.clone();
-            c.spawn(async move {
-                let res = c_clone.append(&append_request).await;
-                if res.is_err() {
-                    warn!("send heartbeat append request failed {:?} ", res);
-                }
-                let res = tx.send(RaftEvent::AppendReply(Err(Error::Rpc(
-                    labrpc::Error::Other(String::from("send error")),
-                ))));
-                if res.is_err() {
-                    warn!("send heartbeat append request failed {:?}", res);
-                }
-            });
+            self.send_append_to(peer_id, c);
         }
+    }
+
+    fn send_append_to(&self, peer_id: usize, c: &RaftClient) {
+        let match_index = self
+            .volatile_state
+            .match_index
+            .get(&(peer_id as u64))
+            .expect("get match index fail");
+
+        assert!(*match_index < self.persistent_state.logs.len() as u64);
+
+        let mut entrys = vec![];
+        for i in (*match_index as usize + 1)..self.persistent_state.logs.len() {
+            let mut data = vec![];
+            let entry = self.persistent_state.logs.get(i).unwrap();
+            labcodec::encode(entry, &mut data).expect("encode entry fail");
+            entrys.push(data);
+        }
+
+        let append_request = AppendArgs {
+            leader_id: self.me as u64,
+            term: self.persistent_state.term,
+            prev_log_index: self.prev_log_index(peer_id),
+            prev_log_term: self.prev_log_term(peer_id),
+            leader_commit: self.volatile_state.commit_index,
+            entrys,
+        };
+        debug!("send append request to peer {}", peer_id);
+        let c_clone = c.clone();
+        let tx = self.tx.clone();
+        c.spawn(async move {
+            let res = c_clone.append(&append_request).await;
+            match res {
+                Err(e) => {
+                    warn!("send heartbeat append request failed {:?} ", e);
+                    return;
+                }
+                Ok(reply) => {
+                    let res = tx.send(RaftEvent::AppendReply {
+                        reply,
+                        peer_id: peer_id as u64,
+                    });
+                    if res.is_err() {
+                        warn!("send heartbeat append request failed {:?}", res);
+                    }
+                }
+            }
+        });
     }
 
     // compare last heart to current, start vote if time out pass
@@ -582,13 +627,18 @@ impl Raft {
         let peer_clone = peer.clone();
         peer.spawn(async move {
             let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
-            if res.is_err() {
-                warn!("send vote error {:?}", res);
-            }
-            let res = result_tx.send(RaftEvent::VoteReply(res));
-            if res.is_err() {
-                warn!("send resp error {:?}", res);
-                return;
+            match res {
+                Err(e) => {
+                    warn!("send vote error {:?}", e);
+                    return;
+                }
+                Ok(reply) => {
+                    let res = result_tx.send(RaftEvent::VoteReply(reply));
+                    if res.is_err() {
+                        warn!("send resp error {:?}", res);
+                        return;
+                    }
+                }
             }
         });
         // rx
@@ -700,8 +750,11 @@ enum RaftEvent {
     CheckElectionTimeOut(u64),
     HeartBeatTimeOut(),
     Append(AppendArgs, oneshot::Sender<Result<AppendReply>>),
-    AppendReply(Result<AppendReply>),
-    VoteReply(Result<RequestVoteReply>),
+    AppendReply {
+        reply: AppendReply,
+        peer_id: u64,
+    },
+    VoteReply(RequestVoteReply),
     Vote(VoteRequestEvent),
 
     Stop,
@@ -1073,11 +1126,11 @@ pub mod my_tests {
         r.becomes_candidate();
         let n = Node::new_disable_timer(r);
 
-        n.send_event(RaftEvent::VoteReply(Ok(RequestVoteReply {
+        n.send_event(RaftEvent::VoteReply(RequestVoteReply {
             term: new_term,
             vote_granted: true,
             peer_id: 0,
-        })));
+        }));
         let (reply, rx) = get_send_rpc::<AppendArgs>(rx);
         assert_eq!(reply.term, new_term);
         assert_eq!(reply.leader_id, me as u64);
@@ -1267,6 +1320,7 @@ pub mod my_tests {
         assert_eq!(append.leader_id, 3);
         assert_eq!(append.term, term);
     }
+    // append client 请求成功
     #[test]
     fn test_client_command_success() {
         let (c, rx) = create_raft_client("test");
@@ -1299,8 +1353,8 @@ pub mod my_tests {
         let res = node.start(&command);
         assert!(res.is_err());
     }
+// [x]append reply 成功leader 更新commit,match_index,next_index
     #[test]
-    #[ignore]
     fn test_commited_index_update() {
         let (c1, rx_1) = create_raft_client("test");
         let (c2, rx_2) = create_raft_client("test");
@@ -1308,9 +1362,29 @@ pub mod my_tests {
 
         let mut r = create_raft_with_client(vec![c1, c2], me);
         let term = 1;
+        r.persistent_state.term = term;
         r.become_leader();
         let n = Node::new_disable_timer(r);
-        // todo append meg
+        let command = MessageForTest { data: 1 };
+
+        let _ = n.start(&command);
+        let state = n.get_state();
+        let (append, rx) = get_send_rpc::<AppendArgs>(rx_1);
+        assert_eq!(append.prev_log_index, 0);
+        assert_eq!(append.entrys.len(), 1);
+        assert_eq!(state.v_state.commit_index, 0);
+        n.send_event(RaftEvent::AppendReply {
+            reply: AppendReply {
+                term: term,
+                success: true,
+                match_index: 1,
+            },
+            peer_id: 0,
+        });
+        let state = n.get_state();
+        assert_eq!(state.v_state.commit_index, 1);
+        assert_eq!(*state.v_state.next_index.get(&0).unwrap(), 2);
+        assert_eq!(*state.v_state.match_index.get(&0).unwrap(), 1);
     }
     #[test]
     fn debug() {
