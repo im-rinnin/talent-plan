@@ -6,10 +6,12 @@ use futures::channel::oneshot;
 use futures::channel::oneshot::channel;
 use futures::executor::block_on;
 use futures::inner_macro::select;
+use futures::SinkExt;
 use log::debug;
 use log::error;
 use log::info;
 use prost::Message;
+use std::cmp::min;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::default;
@@ -146,6 +148,7 @@ pub struct Raft {
     // other state
     rx: Receiver<RaftEvent>,
     tx: Sender<RaftEvent>,
+    apply_tx: UnboundedSender<ApplyMsg>,
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
@@ -184,6 +187,7 @@ impl Raft {
             volatile_state: VolatileState::default(),
             rx: rx,
             tx: tx,
+            apply_tx: apply_ch,
         };
 
         // initialize from state persisted before a crash
@@ -393,9 +397,27 @@ impl Raft {
                     match_indexs.push(*index);
                 }
                 match_indexs.sort();
-                let n = match_indexs.get(match_indexs.len() / 2 + 1).unwrap();
+                let n = match_indexs.get(match_indexs.len() / 2).unwrap();
                 if *n > self.volatile_state.commit_index {
                     info!("update committed index to {}", *n);
+                    for index in (self.volatile_state.commit_index + 1) as usize..(*n + 1) as usize
+                    {
+                        let entry = self
+                            .persistent_state
+                            .logs
+                            .get(index)
+                            .expect("log index {} not found");
+                        let a = ApplyMsg::Command {
+                            data: entry.data.clone(),
+                            index: index as u64,
+                        };
+                        let res = self.apply_tx.unbounded_send(a);
+                        if res.is_err() {
+                            info!("send apply msg error {:?}", res)
+                        }
+
+                        info!("apply entry index {} to apply ch", index);
+                    }
                     self.volatile_state.commit_index = *n;
                 }
             } else {
@@ -432,7 +454,7 @@ impl Raft {
 
             // append/tructe log if match, or refuse log change
             let logs = &mut self.persistent_state.logs;
-            if logs.len() < args.prev_log_index as usize {
+            if logs.len() <= (args.prev_log_index + 1) as usize {
                 info!("prev entry not found, refuse append")
             } else if logs[args.prev_log_index as usize].term as u64 != args.prev_log_term {
                 info!("prev entry not match,refuse append,index is {}, entry term is {}, args prev log term is {}",args.prev_log_index, logs[args.prev_log_index as usize].term ,args.term)
@@ -444,6 +466,31 @@ impl Raft {
                 for data in args.entrys {
                     let entry = labcodec::decode::<Entry>(&data).expect("decode entry error");
                     logs.push(entry);
+                }
+            }
+            let old_committ_index = self.volatile_state.commit_index as usize;
+            self.volatile_state.commit_index = args.leader_commit;
+            if old_committ_index < args.leader_commit as usize
+                && self.persistent_state.logs.len() - 1 > old_committ_index as usize
+            {
+                let end = min(
+                    self.persistent_state.logs.len() - 1,
+                    args.leader_commit as usize,
+                );
+                info!(
+                    "{} update commit index to {} and apply",
+                    self.me, args.leader_commit
+                );
+                for i in old_committ_index + 1..end + 1 {
+                    let entry = self.persistent_state.logs.get(i as usize).unwrap();
+                    let apply_msg = ApplyMsg::Command {
+                        data: entry.data.clone(),
+                        index: i as u64,
+                    };
+                    let res = self.apply_tx.unbounded_send(apply_msg);
+                    if res.is_err() {
+                        warn!("send apply msg error {:?}", res);
+                    }
                 }
             }
             self.save_persist_state();
@@ -548,6 +595,9 @@ impl Raft {
             .next_index
             .get(&(id as u64))
             .expect("should inited");
+        if *res == 0 {
+            return 0;
+        }
         *res - 1
     }
     fn prev_log_term(&self, id: usize) -> u64 {
@@ -1031,7 +1081,8 @@ pub mod my_tests {
     use std::{
         assert_eq,
         convert::TryInto,
-        panic, println, process,
+        panic, println,
+        process::{self, Command},
         sync::{Arc, Mutex, Once},
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -1050,7 +1101,8 @@ pub mod my_tests {
     use labrpc::{Client, Rpc};
 
     use super::{
-        persister::SimplePersister, system_time_now_epoch, Entry, Node, PersistentState, Raft,
+        persister::SimplePersister, system_time_now_epoch, ApplyMsg, Entry, Node, PersistentState,
+        Raft,
     };
     use crate::{proto::raftpb::*, raft::HEARTBEAT_CHECK_INTERVAL};
     use crate::{
@@ -1086,12 +1138,19 @@ pub mod my_tests {
         (raft_client, rx)
     }
 
-    fn create_raft_with_client(clients: Vec<RaftClient>, me: usize) -> Raft {
+    fn create_raft_with_client_with_apply_ch(
+        clients: Vec<RaftClient>,
+        me: usize,
+    ) -> (Raft, UnboundedReceiver<ApplyMsg>) {
         init_logger();
         crash_process_when_any_thread_panic();
         let p = SimplePersister::new();
-        let (tx, _) = unbounded();
-        Raft::new(clients, me, Box::new(p), tx)
+        let (tx, rx) = unbounded();
+        (Raft::new(clients, me, Box::new(p), tx), rx)
+    }
+    fn create_raft_with_client(clients: Vec<RaftClient>, me: usize) -> Raft {
+        let (res, _) = create_raft_with_client_with_apply_ch(clients, me);
+        res
     }
     fn create_raft() -> Raft {
         create_raft_with_client(vec![], 0)
@@ -1493,14 +1552,14 @@ pub mod my_tests {
         let res = node.start(&command);
         assert!(res.is_err());
     }
-    // [x]append reply 成功leader 更新commit,match_index,next_index
+    // [x]append reply 成功leader 更新commit,match_index,next_index,apply entry
     #[test]
     fn test_commited_index_update() {
         let (c1, rx_1) = create_raft_client("test");
         let (c2, rx_2) = create_raft_client("test");
         let me = 3;
 
-        let mut r = create_raft_with_client(vec![c1, c2], me);
+        let (mut r, rx_ch) = create_raft_with_client_with_apply_ch(vec![c1, c2], me);
         let term = 1;
         r.persistent_state.term = term;
         r.become_leader();
@@ -1525,6 +1584,18 @@ pub mod my_tests {
         assert_eq!(state.v_state.commit_index, 1);
         assert_eq!(*state.v_state.next_index.get(&0).unwrap(), 2);
         assert_eq!(*state.v_state.match_index.get(&0).unwrap(), 1);
+
+        let (res, _) = block_on(async { rx_ch.into_future().await });
+        let msg = res.unwrap();
+        match msg {
+            ApplyMsg::Command { data, index } => {
+                assert_eq!(index, 1);
+                let data = labcodec::decode::<MessageForTest>(&data).unwrap();
+                assert_eq!(data.data, 1);
+                assert_eq!(index, 1);
+            }
+            _ => {}
+        }
     }
     #[test]
     fn debug() {
