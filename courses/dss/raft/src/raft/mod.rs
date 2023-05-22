@@ -77,7 +77,6 @@ pub struct PersistentState {
     #[prost(uint64, tag = "1")]
     pub term: u64,
     #[prost(uint64, optional, tag = "2")]
-    // -1 not vote
     pub voted_for: Option<u64>,
     #[prost(message, repeated, tag = "3")]
     pub logs: Vec<Entry>,
@@ -202,15 +201,6 @@ impl Raft {
         self.volatile_state.time_to_check_election_time_out = check_time;
     }
 
-    // for test
-    fn set_persistent_state(&mut self, state: PersistentState) {
-        self.persistent_state = state;
-        self.save_persist_state();
-    }
-    fn set_volatitle_state(&mut self, state: VolatileState) {
-        self.volatile_state = state;
-    }
-
     fn main(mut self) {
         loop {
             //
@@ -230,7 +220,8 @@ impl Raft {
                     }
                     RaftEvent::Vote(vote) => {
                         debug!("recv vote event");
-                        self.handle_vote(&vote.request);
+                        let reply = self.handle_vote(&vote.request);
+                        vote.reply.send(reply).expect("send vote reply error");
                     }
                     RaftEvent::VoteReply(reply_result) => {
                         self.handle_vote_reply(reply_result);
@@ -306,16 +297,41 @@ impl Raft {
         self.send_vote(self.persistent_state.term);
     }
     fn handle_vote(&mut self, vote: &RequestVoteArgs) -> RequestVoteReply {
-        return if vote.term < self.persistent_state.term {
-            RequestVoteReply {
-                peer_id: self.me as u64,
-                term: self.persistent_state.term,
-                vote_granted: false,
-            }
-        } else if vote.term == self.persistent_state.term {
-            todo!()
-        } else {
-            todo!()
+        let mut accept = false;
+        // term is less than current term,refuse it
+        let last_entry = self.persistent_state.logs.last().unwrap();
+        let last_entry_term = last_entry.term;
+        let last_entry_index = self.persistent_state.logs.len() - 1;
+        if last_entry_term < vote.last_log_term
+            || (last_entry_term == vote.last_log_term
+                && last_entry_index as u64 <= vote.last_log_index)
+        {
+            // if term equal
+            if vote.term == self.persistent_state.term {
+                if self.volatile_state.role == Role::LEADER
+                    || self.volatile_state.role == Role::FOLLOWER
+                {
+                    if self.persistent_state.voted_for.is_none() {
+                        accept = true;
+                        self.becomes_follower(vote.term, Some(vote.peer_id));
+                        self.update_election_check_time_out();
+                    } else if self.persistent_state.voted_for.unwrap() == vote.peer_id {
+                        accept = true;
+                        self.update_election_check_time_out();
+                    }
+                    // vote for not equal,refuse it
+                }
+            // if term bigger current
+            } else if vote.term > self.persistent_state.term {
+                self.becomes_follower(vote.term, Some(vote.peer_id));
+                self.update_election_check_time_out();
+                accept = true;
+            };
+        }
+        return RequestVoteReply {
+            peer_id: self.me as u64,
+            term: self.persistent_state.term,
+            vote_granted: accept,
         };
     }
 
@@ -586,7 +602,6 @@ impl Raft {
         }
     }
     fn restore(&mut self, data: &[u8]) {
-        // todo need test
         if data.is_empty() {
             info!("raft persist is empty");
             return;
@@ -726,13 +741,13 @@ impl Raft {
 
 #[derive(Debug, Clone)]
 enum RaftReply {
-    VoteReply(Result<RequestVoteReply>),
+    VoteReply(RequestVoteReply),
 }
 
 #[derive(Debug)]
 struct VoteRequestEvent {
     request: RequestVoteArgs,
-    reply: oneshot::Sender<Result<RequestVoteReply>>,
+    reply: oneshot::Sender<RequestVoteReply>,
 }
 enum RequestEvent {
     Vote(VoteRequestEvent),
@@ -940,10 +955,7 @@ impl RaftService for Node {
 
         let t = rx.await;
         match t {
-            Ok(res) => match res {
-                Ok(r) => labrpc::Result::Ok(r),
-                Err(e) => labrpc::Result::Err(labrpc::Error::Other(e.to_string())),
-            },
+            Ok(res) => labrpc::Result::Ok(res),
             Err(e) => labrpc::Result::Err(labrpc::Error::Other(e.to_string())),
         }
     }
@@ -1117,7 +1129,7 @@ pub mod my_tests {
     #[test]
 
     // 选举成功，发送心跳
-    fn test_election_success() {
+    fn test_candidate_election_success() {
         let (c, rx) = create_raft_client("test");
         let me = 1;
         let new_term = 1;
@@ -1163,6 +1175,99 @@ pub mod my_tests {
         assert_eq!(state.p_state.term, old_term + 1);
         let (_reply) = get_send_rpc::<RequestVoteArgs>(rx);
     }
+    //  followe/leader 接受选举
+    #[test]
+    fn test_follower_accept_election() {
+        let (c, rx) = create_raft_client("test");
+        let me = 1;
+        let mut r = create_raft_with_client(vec![c], me);
+        r.becomes_follower(0, None);
+        let n = Node::new(r);
+        let new_term = 2;
+        let leader_id = 0;
+        let reply = block_on(async {
+            n.request_vote(RequestVoteArgs {
+                peer_id: leader_id,
+                term: new_term,
+                last_log_index: 0,
+                last_log_term: 0,
+            })
+            .await
+        })
+        .unwrap();
+
+        let state = n.get_state();
+        assert_eq!(state.p_state.term, new_term);
+        assert_eq!(state.p_state.voted_for.unwrap(), leader_id);
+
+        assert_eq!(reply.term, new_term);
+        assert_eq!(reply.vote_granted, true);
+        assert_eq!(reply.peer_id as usize, me);
+    }
+    // [] followe/leader 拒绝选举 已经投票/term
+    #[test]
+    fn test_election_refuse_already_vote() {
+        let (c, rx) = create_raft_client("test");
+        let me = 3;
+        let mut r = create_raft_with_client(vec![c], me);
+        // vote for 5
+        let _ = r.persistent_state.voted_for.insert(5);
+        r.becomes_candidate();
+        let n = Node::new_disable_timer(r);
+
+        let (tx, rx) = oneshot::channel::<RequestVoteReply>();
+        n.send_event(RaftEvent::Vote(super::VoteRequestEvent {
+            request: RequestVoteArgs {
+                peer_id: 4,
+                term: 1,
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+            reply: tx,
+        }));
+
+        let res = block_on(async { rx.await }).unwrap();
+        assert_eq!(res.vote_granted, false)
+    }
+
+    //  followe/leader 拒绝选举 logs不够新
+    #[test]
+    pub fn test_election_follower_refuse_log_is_old() {
+        let (c, rx) = create_raft_client("test");
+        let me = 3;
+        let mut r = create_raft_with_client(vec![c], me);
+
+        let logs = &mut r.persistent_state.logs;
+        logs.push(Entry {
+            data: vec![1],
+            term: 1,
+        });
+        logs.push(Entry {
+            data: vec![1],
+            term: 1,
+        });
+        logs.push(Entry {
+            data: vec![1],
+            term: 2,
+        });
+
+        let n = Node::new_disable_timer(r);
+
+        let (tx, rx) = oneshot::channel::<RequestVoteReply>();
+        n.send_event(RaftEvent::Vote(super::VoteRequestEvent {
+            request: RequestVoteArgs {
+                peer_id: 4,
+                term: 3,
+                last_log_index: 2,
+                last_log_term: 2,
+            },
+            reply: tx,
+        }));
+
+        let res = block_on(async { rx.await }).unwrap();
+        assert_eq!(res.vote_granted, false)
+    }
+
     // 选举失败，其他节点成功
     #[test]
     fn test_election_but_fail() {
@@ -1353,7 +1458,7 @@ pub mod my_tests {
         let res = node.start(&command);
         assert!(res.is_err());
     }
-// [x]append reply 成功leader 更新commit,match_index,next_index
+    // [x]append reply 成功leader 更新commit,match_index,next_index
     #[test]
     fn test_commited_index_update() {
         let (c1, rx_1) = create_raft_client("test");

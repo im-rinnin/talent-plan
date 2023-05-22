@@ -5,7 +5,7 @@ use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot;
 use futures::executor::ThreadPool;
 use futures::future::{self, FutureExt};
-use log::{debug, error};
+use log::{debug, error, warn};
 
 use crate::error::{Error, Result};
 use crate::server::RpcFuture;
@@ -72,7 +72,7 @@ impl Client {
         let res = self.sender.unbounded_send(rpc);
         // Sends requests and waits responses.
         if res.is_err() {
-            error!("errro {:?}", res);
+            warn!("send rpc errro {:?}", res);
             return Box::pin(future::err(Error::Stopped));
         }
         // if self.sender.unbounded_send(rpc).is_err() {
