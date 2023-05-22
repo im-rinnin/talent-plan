@@ -115,8 +115,9 @@ impl Default for VolatileState {
 }
 
 /// State of a raft peer.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct State {
+    me: usize,
     p_state: PersistentState,
     v_state: VolatileState,
 }
@@ -219,11 +220,12 @@ impl Raft {
                         self.handle_heartbeat_event();
                     }
                     RaftEvent::Vote(vote) => {
-                        debug!("recv vote event");
+                        info!("{} recv vote event ", self.me);
                         let reply = self.handle_vote(&vote.request);
                         vote.reply.send(reply).expect("send vote reply error");
                     }
                     RaftEvent::VoteReply(reply_result) => {
+                        info!("{} recv vote reply ", self.me);
                         self.handle_vote_reply(reply_result);
                     }
                     RaftEvent::Append(request, reply) => self.handle_append(request, reply),
@@ -233,6 +235,7 @@ impl Raft {
                     RaftEvent::ReadState(reply) => {
                         reply
                             .send(State {
+                                me: self.me,
                                 p_state: self.get_persitent_state(),
                                 v_state: self.get_volatitle_state(),
                             })
@@ -262,6 +265,7 @@ impl Raft {
     }
 
     fn becomes_candidate(&mut self) {
+        info!("{} become candidate", self.me);
         self.persistent_state.term += 1;
         self.volatile_state.role = Role::CANDIDATOR;
         self.volatile_state.vote_record.clear();
@@ -283,9 +287,11 @@ impl Raft {
     fn handle_election_timeout(&mut self, instant: u64) {
         // self.set_up_election_timeout_checker();
         if self.volatile_state.time_to_check_election_time_out != instant {
+            self.set_up_election_timeout_checker();
             return;
         }
         if self.volatile_state.role == Role::LEADER {
+            self.set_up_election_timeout_checker();
             return;
         }
         info!("{} elclection timeout,start election", self.me);
@@ -295,6 +301,7 @@ impl Raft {
 
         self.save_persist_state();
         self.send_vote(self.persistent_state.term);
+        self.set_up_election_timeout_checker();
     }
     fn handle_vote(&mut self, vote: &RequestVoteArgs) -> RequestVoteReply {
         let mut accept = false;
@@ -313,6 +320,11 @@ impl Raft {
                 {
                     if self.persistent_state.voted_for.is_none() {
                         accept = true;
+                        info!(
+                            "accept vote from {},{} become follower",
+                            vote.peer_id, self.me
+                        );
+
                         self.becomes_follower(vote.term, Some(vote.peer_id));
                         self.update_election_check_time_out();
                     } else if self.persistent_state.voted_for.unwrap() == vote.peer_id {
@@ -323,25 +335,37 @@ impl Raft {
                 }
             // if term bigger current
             } else if vote.term > self.persistent_state.term {
+                info!(
+                    "accept vote from {},{} become follower",
+                    vote.peer_id, self.me
+                );
                 self.becomes_follower(vote.term, Some(vote.peer_id));
                 self.update_election_check_time_out();
                 accept = true;
             };
         }
-        return RequestVoteReply {
+        let res = RequestVoteReply {
             peer_id: self.me as u64,
             term: self.persistent_state.term,
             vote_granted: accept,
         };
+        debug!("send vote reply resp {:?} to {}", res, vote.peer_id);
+        return res;
     }
 
     fn handle_vote_reply(&mut self, reply: RequestVoteReply) {
         if reply.term == self.persistent_state.term
             && self.volatile_state.role == Role::CANDIDATOR
             && reply.vote_granted
+            && self
+                .volatile_state
+                .vote_record
+                .get(&reply.peer_id)
+                .is_none()
         {
+            info!("vote accept add one from {}", reply.peer_id);
             self.volatile_state.vote_record.insert(reply.peer_id);
-            if self.volatile_state.vote_record.len() > self.peers.len() / 2 + 1 {
+            if self.volatile_state.vote_record.len() >= self.peers.len() / 2 + 1 {
                 self.become_leader();
                 self.save_persist_state();
                 self.send_append_to_all_client();
@@ -382,6 +406,10 @@ impl Raft {
                 self.send_append_to(peer_id as usize, self.peers.get(peer_id as usize).unwrap());
             }
         } else {
+            info!(
+                "accept append reply ,term is bigger than me ,{} become follower",
+                self.me
+            );
             self.becomes_follower(reply.term, None);
         }
     }
@@ -395,6 +423,10 @@ impl Raft {
                 match_index: 0,
             }
         } else {
+            info!(
+                "accept append from {},term is bigger or more than me, {} become follower",
+                args.leader_id, self.me
+            );
             self.becomes_follower(args.term, None);
             let mut accept = false;
 
@@ -467,7 +499,7 @@ impl Raft {
     }
 
     fn become_leader(&mut self) {
-        info!("get votes from majority ,become leader");
+        info!("get votes from majority , {} become leader", self.me);
         self.volatile_state.role = Role::LEADER;
         self.volatile_state.next_index.clear();
         self.volatile_state.match_index.clear();
@@ -640,6 +672,7 @@ impl Raft {
     ) {
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
+        let me = self.me;
         peer.spawn(async move {
             let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
             match res {
@@ -651,7 +684,8 @@ impl Raft {
                     let res = result_tx.send(RaftEvent::VoteReply(reply));
                     if res.is_err() {
                         warn!("send resp error {:?}", res);
-                        return;
+                    } else {
+                        debug!("{} send vote to {:} ok", me, server);
                     }
                 }
             }
@@ -891,6 +925,7 @@ impl Node {
         t.send(RaftEvent::ReadState(tx))
             .expect("send read state request error");
         let res = rx.recv().expect("read state error");
+        debug!(" get state res is {:?}", res);
         res
     }
 
