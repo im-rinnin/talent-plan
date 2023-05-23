@@ -392,12 +392,20 @@ impl Raft {
                 let match_index = self.volatile_state.match_index.get_mut(&peer_id).unwrap();
                 *match_index = reply.match_index;
                 //  update commit index
+                // add this node log last index
                 let mut match_indexs = vec![(self.persistent_state.logs.len() - 1) as u64];
-                for (_, index) in &self.volatile_state.match_index {
+                // add other raft match index
+                for (id, index) in &self.volatile_state.match_index {
+                    if (*id as usize) == self.me {
+                        continue;
+                    }
                     match_indexs.push(*index);
                 }
                 match_indexs.sort();
+                match_indexs.reverse();
                 let n = match_indexs.get(match_indexs.len() / 2).unwrap();
+                info!("current major match index is {} ,match indexs is {:?},current commit index is {}",*n,match_indexs,self.volatile_state.commit_index);
+
                 if *n > self.volatile_state.commit_index {
                     info!("update committed index to {}", *n);
                     for index in (self.volatile_state.commit_index + 1) as usize..(*n + 1) as usize
@@ -406,11 +414,12 @@ impl Raft {
                             .persistent_state
                             .logs
                             .get(index)
-                            .expect("log index {} not found");
+                            .expect("log index not found");
                         let a = ApplyMsg::Command {
                             data: entry.data.clone(),
                             index: index as u64,
                         };
+                        info!("{} apply entry to index {}", self.me, index);
                         let res = self.apply_tx.unbounded_send(a);
                         if res.is_err() {
                             info!("send apply msg error {:?}", res)
@@ -439,6 +448,10 @@ impl Raft {
     fn handle_append(&mut self, args: AppendArgs, reply_ch: oneshot::Sender<Result<AppendReply>>) {
         // validate term
         let reply = if args.term < self.persistent_state.term {
+            info!(
+                "term {} is less than mine term{},refuse append",
+                args.term, self.persistent_state.term
+            );
             AppendReply {
                 term: self.persistent_state.term,
                 success: false,
@@ -453,8 +466,9 @@ impl Raft {
             let mut accept = false;
 
             // append/tructe log if match, or refuse log change
+            let max_index = self.last_log_index() as u64;
             let logs = &mut self.persistent_state.logs;
-            if logs.len() <= (args.prev_log_index + 1) as usize {
+            if max_index < args.prev_log_index {
                 info!("prev entry not found, refuse append")
             } else if logs[args.prev_log_index as usize].term as u64 != args.prev_log_term {
                 info!("prev entry not match,refuse append,index is {}, entry term is {}, args prev log term is {}",args.prev_log_index, logs[args.prev_log_index as usize].term ,args.term)
@@ -468,30 +482,28 @@ impl Raft {
                     logs.push(entry);
                 }
             }
-            let old_committ_index = self.volatile_state.commit_index as usize;
-            self.volatile_state.commit_index = args.leader_commit;
-            if old_committ_index < args.leader_commit as usize
-                && self.persistent_state.logs.len() - 1 > old_committ_index as usize
+
+            if self.volatile_state.commit_index < args.leader_commit
+                && self.last_log_index() as u64 > self.volatile_state.commit_index
             {
-                let end = min(
-                    self.persistent_state.logs.len() - 1,
-                    args.leader_commit as usize,
-                );
+                let end = min(self.last_log_index(), args.leader_commit as usize) as u64;
                 info!(
                     "{} update commit index to {} and apply",
                     self.me, args.leader_commit
                 );
-                for i in old_committ_index + 1..end + 1 {
+                for i in self.volatile_state.commit_index + 1..end + 1 {
                     let entry = self.persistent_state.logs.get(i as usize).unwrap();
                     let apply_msg = ApplyMsg::Command {
                         data: entry.data.clone(),
                         index: i as u64,
                     };
+                    info!("{} apply entry to index {}", self.me, i);
                     let res = self.apply_tx.unbounded_send(apply_msg);
                     if res.is_err() {
                         warn!("send apply msg error {:?}", res);
                     }
                 }
+                self.volatile_state.commit_index = end;
             }
             self.save_persist_state();
             AppendReply {
@@ -500,6 +512,8 @@ impl Raft {
                 match_index: (self.persistent_state.logs.len() - 1) as u64,
             }
         };
+
+        info!("{} send append reply {:?}", self.me, reply);
 
         reply_ch
             .send(Ok(reply))
@@ -588,24 +602,8 @@ impl Raft {
             debug!("send time out check event");
         });
     }
-
-    fn prev_log_index(&self, id: usize) -> u64 {
-        let res = self
-            .volatile_state
-            .next_index
-            .get(&(id as u64))
-            .expect("should inited");
-        if *res == 0 {
-            return 0;
-        }
-        *res - 1
-    }
-    fn prev_log_term(&self, id: usize) -> u64 {
-        let index = self.prev_log_index(id);
-        if index == 0 {
-            return 0;
-        }
-        let entry = &self.persistent_state.logs[index as usize];
+    fn entry_term(&self, index: usize) -> u64 {
+        let entry = &self.persistent_state.logs[index];
         return entry.term;
     }
 
@@ -619,16 +617,16 @@ impl Raft {
     }
 
     fn send_append_to(&self, peer_id: usize, c: &RaftClient) {
-        let match_index = self
+        let next_index = self
             .volatile_state
-            .match_index
+            .next_index
             .get(&(peer_id as u64))
             .expect("get match index fail");
 
-        assert!(*match_index < self.persistent_state.logs.len() as u64);
+        assert!(*next_index <= self.persistent_state.logs.len() as u64);
 
         let mut entrys = vec![];
-        for i in (*match_index as usize + 1)..self.persistent_state.logs.len() {
+        for i in (*next_index as usize)..self.persistent_state.logs.len() {
             let mut data = vec![];
             let entry = self.persistent_state.logs.get(i).unwrap();
             labcodec::encode(entry, &mut data).expect("encode entry fail");
@@ -638,8 +636,8 @@ impl Raft {
         let append_request = AppendArgs {
             leader_id: self.me as u64,
             term: self.persistent_state.term,
-            prev_log_index: self.prev_log_index(peer_id),
-            prev_log_term: self.prev_log_term(peer_id),
+            prev_log_index: (*next_index - 1),
+            prev_log_term: self.entry_term((*next_index - 1) as usize),
             leader_commit: self.volatile_state.commit_index,
             entrys,
         };
