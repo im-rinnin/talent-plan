@@ -18,6 +18,7 @@ use std::default;
 use std::f32::consts::E;
 use std::ops::Add;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::thread::spawn;
 use std::time::Duration;
@@ -40,13 +41,14 @@ use self::persister::*;
 use crate::proto::kvraftpb::Op;
 use crate::proto::raftpb::*;
 
-const HEARTBEAT_CHECK_INTERVAL: u64 = 20;
+const HEARTBEAT_CHECK_INTERVAL: u64 = 40;
 const ELECTION_TIMEOUT_MIN_TIME: u64 = 150;
 const ELECTION_TIMEOUT_RANGE: u64 = 150;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
 /// server, via the `apply_ch` passed to `Raft::new`.
+#[derive(Debug)]
 pub enum ApplyMsg {
     Command {
         data: Vec<u8>,
@@ -204,6 +206,10 @@ impl Raft {
         let start = system_time_now_epoch();
         let check_time = start + Self::random_timeout().as_millis() as u64;
         self.volatile_state.time_to_check_election_time_out = check_time;
+        info!(
+            "{} set election timeout check time to {}",
+            self.me, check_time
+        );
     }
 
     fn main(mut self) {
@@ -212,8 +218,11 @@ impl Raft {
             let res = self.rx.recv();
             info!("receive raft event {:?}", res);
             match res {
-                Err(RecvError) => {
-                    info!("raft handler chan receive error {},stop handle", RecvError);
+                Err(e) => {
+                    info!(
+                        "{} raft handler chan receive error {},stop handle",
+                        self.me, e
+                    );
                     return;
                 }
                 Ok(event) => match event {
@@ -289,12 +298,13 @@ impl Raft {
     }
 
     fn handle_election_timeout(&mut self, instant: u64) {
-        // self.set_up_election_timeout_checker();
-        if self.volatile_state.time_to_check_election_time_out != instant {
+        if self.volatile_state.role == Role::LEADER {
+            self.update_election_check_time_out();
             self.set_up_election_timeout_checker();
             return;
         }
-        if self.volatile_state.role == Role::LEADER {
+        if self.volatile_state.time_to_check_election_time_out != instant {
+            info!("{} elclection timeout check pass", self.me);
             self.set_up_election_timeout_checker();
             return;
         }
@@ -379,10 +389,17 @@ impl Raft {
     fn handle_append_reply(&mut self, reply: AppendReply, peer_id: u64) {
         // validate reply
         if self.volatile_state.role != Role::LEADER {
-            info!("receive append reply but current role is not leader,ignore");
+            info!(
+                "{} receive append reply but current role is not leader,ignore",
+                self.me
+            );
             return;
         }
         if reply.term < self.persistent_state.term {
+            info!(
+                "{} receive append, term {} is less than me:{} ignore",
+                self.me, reply.term, self.persistent_state.term
+            );
             return;
         } else if reply.term == self.persistent_state.term {
             if reply.success {
@@ -404,10 +421,12 @@ impl Raft {
                 match_indexs.sort();
                 match_indexs.reverse();
                 let n = match_indexs.get(match_indexs.len() / 2).unwrap();
-                info!("current major match index is {} ,match indexs is {:?},current commit index is {}",*n,match_indexs,self.volatile_state.commit_index);
+                info!("{} current major match index is {} ,match indexs is {:?},current commit index is {}",self.me,*n,match_indexs,self.volatile_state.commit_index);
 
-                if *n > self.volatile_state.commit_index {
-                    info!("update committed index to {}", *n);
+                if *n > self.volatile_state.commit_index
+                    && self.entry_term(*n as usize) == self.persistent_state.term
+                {
+                    info!("{} update committed index to {}", self.me, *n);
                     for index in (self.volatile_state.commit_index + 1) as usize..(*n + 1) as usize
                     {
                         let entry = self
@@ -415,17 +434,22 @@ impl Raft {
                             .logs
                             .get(index)
                             .expect("log index not found");
-                        let a = ApplyMsg::Command {
+                        let apply_msg = ApplyMsg::Command {
                             data: entry.data.clone(),
                             index: index as u64,
                         };
-                        info!("{} apply entry to index {}", self.me, index);
-                        let res = self.apply_tx.unbounded_send(a);
+                        let data = match &apply_msg {
+                            ApplyMsg::Command { data, index } => data,
+                            ApplyMsg::Snapshot { data, term, index } => data,
+                        };
+                        info!(
+                            "{} apply entry {:?} to index {} for apped apply,data is {:?}",
+                            self.me, apply_msg, index, data
+                        );
+                        let res = self.apply_tx.unbounded_send(apply_msg);
                         if res.is_err() {
                             info!("send apply msg error {:?}", res)
                         }
-
-                        info!("apply entry index {} to apply ch", index);
                     }
                     self.volatile_state.commit_index = *n;
                 }
@@ -481,30 +505,34 @@ impl Raft {
                     let entry = labcodec::decode::<Entry>(&data).expect("decode entry error");
                     logs.push(entry);
                 }
+
+                if self.volatile_state.commit_index < args.leader_commit
+                    && self.last_log_index() as u64 > self.volatile_state.commit_index
+                {
+                    let end = min(self.last_log_index(), args.leader_commit as usize) as u64;
+                    for i in self.volatile_state.commit_index + 1..end + 1 {
+                        let entry = self.persistent_state.logs.get(i as usize).unwrap();
+                        let apply_msg = ApplyMsg::Command {
+                            data: entry.data.clone(),
+                            index: i as u64,
+                        };
+                        let data = match &apply_msg {
+                            ApplyMsg::Command { data, index } => data,
+                            ApplyMsg::Snapshot { data, term, index } => data,
+                        };
+                        info!(
+                            "{} apply entry {:?} to index {},accept append from {},data is {:?}",
+                            self.me, apply_msg, i, args.leader_id, data
+                        );
+                        let res = self.apply_tx.unbounded_send(apply_msg);
+                        if res.is_err() {
+                            warn!("send apply msg error {:?}", res);
+                        }
+                    }
+                    self.volatile_state.commit_index = end;
+                }
             }
 
-            if self.volatile_state.commit_index < args.leader_commit
-                && self.last_log_index() as u64 > self.volatile_state.commit_index
-            {
-                let end = min(self.last_log_index(), args.leader_commit as usize) as u64;
-                info!(
-                    "{} update commit index to {} and apply",
-                    self.me, args.leader_commit
-                );
-                for i in self.volatile_state.commit_index + 1..end + 1 {
-                    let entry = self.persistent_state.logs.get(i as usize).unwrap();
-                    let apply_msg = ApplyMsg::Command {
-                        data: entry.data.clone(),
-                        index: i as u64,
-                    };
-                    info!("{} apply entry to index {}", self.me, i);
-                    let res = self.apply_tx.unbounded_send(apply_msg);
-                    if res.is_err() {
-                        warn!("send apply msg error {:?}", res);
-                    }
-                }
-                self.volatile_state.commit_index = end;
-            }
             self.save_persist_state();
             AppendReply {
                 term: self.persistent_state.term,
@@ -514,12 +542,11 @@ impl Raft {
         };
 
         info!("{} send append reply {:?}", self.me, reply);
-
         reply_ch
             .send(Ok(reply))
             .expect("send append reply to chan failed");
     }
-    fn handle_command(&mut self, data: Vec<u8>, reply: oneshot::Sender<ClientCommandReply>) {
+    fn handle_command(&mut self, data: Vec<u8>, reply: Sender<ClientCommandReply>) {
         if self.volatile_state.role != Role::LEADER {
             reply
                 .send(ClientCommandReply {
@@ -554,6 +581,7 @@ impl Raft {
         // check last append send
         let now = system_time_now_epoch();
         if now - self.volatile_state.last_send_append_time >= HEARTBEAT_CHECK_INTERVAL {
+            info!("{} heart beat timeout, send append to all node", self.me);
             self.send_append_to_all_client();
             self.volatile_state.last_send_append_time = now;
         }
@@ -593,7 +621,7 @@ impl Raft {
             0
         };
 
-        debug!("set next time out check after {} ms", duration);
+        info!("set next time out check after {} ms", duration);
         let tx = self.tx.clone();
         let _join = spawn(move || {
             thread::sleep(Duration::from_millis(duration));
@@ -641,7 +669,10 @@ impl Raft {
             leader_commit: self.volatile_state.commit_index,
             entrys,
         };
-        debug!("send append request to peer {}", peer_id);
+        info!(
+            "{} send append request {:?} to peer {}",
+            self.me, append_request, peer_id
+        );
         let c_clone = c.clone();
         let tx = self.tx.clone();
         c.spawn(async move {
@@ -677,13 +708,16 @@ impl Raft {
             if peer_id == self.me {
                 continue;
             }
-            debug!("send vote request to peer {}", peer_id);
+            info!(
+                "{} send vote request {:?} to peer {}",
+                self.me, request, peer_id
+            );
             self.send_request_vote(peer_id, request.clone(), self.tx.clone());
         }
     }
     fn restore(&mut self, data: &[u8]) {
         if data.is_empty() {
-            info!("raft persist is empty");
+            info!("{} raft persist is empty", self.me);
             return;
         }
         let res = labcodec::decode::<PersistentState>(data);
@@ -733,7 +767,7 @@ impl Raft {
                     if res.is_err() {
                         warn!("send resp error {:?}", res);
                     } else {
-                        debug!("{} send vote to {:} ok", me, server);
+                        info!("{} send vote {:?} to {:} ok", me, args, server);
                     }
                 }
             }
@@ -813,6 +847,7 @@ impl Raft {
     }
 
     pub fn save_persist_state(&mut self) {
+        info!("{} save persiste state", self.me);
         let mut data = Vec::new();
         self.persistent_state
             .encode(&mut data)
@@ -859,7 +894,7 @@ enum RaftEvent {
 
     ClientCommand {
         data: Vec<u8>,
-        reply: oneshot::Sender<ClientCommandReply>,
+        reply: Sender<ClientCommandReply>,
     },
 }
 
@@ -879,7 +914,7 @@ enum RaftEvent {
 // ```
 #[derive(Clone)]
 pub struct Node {
-    tx: Arc<async_lock::Mutex<Sender<RaftEvent>>>, // Your code here.
+    tx: Arc<Mutex<Sender<RaftEvent>>>, // Your code here.
 }
 
 impl Node {
@@ -889,7 +924,7 @@ impl Node {
         // let handler = RaftHandler::new(raft);
         let tx = raft.run();
         Node {
-            tx: Arc::new(async_lock::Mutex::new(tx)),
+            tx: Arc::new(Mutex::new(tx)),
         }
     }
 
@@ -899,7 +934,7 @@ impl Node {
         // let handler = RaftHandler::new(raft);
         let tx = raft.run_with_timer(false);
         Node {
-            tx: Arc::new(async_lock::Mutex::new(tx)),
+            tx: Arc::new(Mutex::new(tx)),
         }
     }
 
@@ -924,28 +959,25 @@ impl Node {
         // self.raft.start(command)
 
         let mut data = vec![];
-        command.encode(&mut data);
-        let (tx, rx) = oneshot::channel();
+        command.encode(&mut data).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
 
-        block_on(async {
-            let g = self.tx.lock().await;
-            let res = g.send_timeout(
-                RaftEvent::ClientCommand {
-                    data: data,
-                    reply: tx,
-                },
-                Duration::from_millis(10),
-            );
-            res.expect("send client timeout ");
-        });
+        let g = self.tx.lock().expect("lock fail");
+        let res = g.send_timeout(
+            RaftEvent::ClientCommand {
+                data: data,
+                reply: tx,
+            },
+            Duration::from_millis(20),
+        );
+        if let Err(e) = res {
+            error!("send command timeout");
+            panic!()
+        }
 
-        let res = block_on(async {
-            let receive_res = rx.await;
-            let res = receive_res.expect("receive client command error");
-            res
-        });
+        let receive_res = rx.recv();
+        let res = receive_res.expect("receive client command error");
         if res.success {
-            debug!("log is {:?}", res.index);
             Ok((res.index, res.term))
         } else {
             Err(Error::NotLeader)
@@ -964,11 +996,11 @@ impl Node {
 
     // for test
     fn send_event(&self, event: RaftEvent) {
-        let t = block_on(self.tx.lock());
+        let t = self.tx.lock().expect("lock error");
         t.send(event).expect("send read state request error");
     }
     fn get_state(&self) -> State {
-        let t = block_on(self.tx.lock());
+        let t = self.tx.lock().expect("lock erro");
         let (tx, rx) = crossbeam_channel::unbounded();
         t.send(RaftEvent::ReadState(tx))
             .expect("send read state request error");
@@ -1031,10 +1063,12 @@ impl RaftService for Node {
             request: args,
             reply: tx,
         };
-        let guard = self.tx.lock().await;
-        guard
-            .send(RaftEvent::Vote(vote_event))
-            .expect("send vote request failed");
+        {
+            let guard = self.tx.lock().unwrap();
+            guard
+                .send(RaftEvent::Vote(vote_event))
+                .expect("send vote request failed");
+        }
 
         let t = rx.await;
         match t {
@@ -1049,10 +1083,12 @@ impl RaftService for Node {
             info!("receive append from peer {}", args.leader_id);
             let (tx, rx) = oneshot::channel();
             let append_event = RaftEvent::Append(args, tx);
-            let guard = self.tx.lock().await;
-            guard
-                .send(append_event)
-                .expect("send append request failed");
+            {
+                let guard = self.tx.lock().expect("lock error");
+                guard
+                    .send(append_event)
+                    .expect("send append request failed");
+            }
 
             let t = rx.await;
             match t {
@@ -1090,7 +1126,7 @@ pub mod my_tests {
     use futures::{
         channel::{
             mpsc::{channel, unbounded, UnboundedReceiver},
-            oneshot,
+            oneshot::{self, Sender},
         },
         executor::{block_on, ThreadPool},
         FutureExt, SinkExt, StreamExt, TryFutureExt,
@@ -1595,24 +1631,60 @@ pub mod my_tests {
             _ => {}
         }
     }
+    // 只对当前term的entry进行commit，之前term的entry，即使数量达到要求，也不进行commit
     #[test]
+    fn test_only_update_commite_for_current_term_entry() {
+        let (c1, _) = create_raft_client("test");
+        let me = 2;
+        let (mut r, rx_ch) = create_raft_with_client_with_apply_ch(vec![c1], me);
+        let term = 2;
+        r.persistent_state.term = term;
+        let logs = &mut r.persistent_state.logs;
+
+        logs.push(Entry {
+            data: vec![1],
+            term: 1,
+        });
+
+        logs.push(Entry {
+            data: vec![1],
+            term: 2,
+        });
+
+        r.become_leader();
+        let n = Node::new_disable_timer(r);
+
+        n.send_event(RaftEvent::AppendReply {
+            reply: AppendReply {
+                term: 2,
+                success: true,
+                match_index: 1,
+            },
+            peer_id: 0,
+        });
+
+        let s = n.get_state();
+        assert_eq!(s.p_state.logs.len(), 3);
+        assert_eq!(s.v_state.commit_index, 0);
+
+        n.send_event(RaftEvent::AppendReply {
+            reply: AppendReply {
+                term: 2,
+                success: true,
+                match_index: 2,
+            },
+            peer_id: 0,
+        });
+        let s = n.get_state();
+        assert_eq!(s.p_state.logs.len(), 3);
+        assert_eq!(s.v_state.commit_index, 2);
+    }
+    #[test]
+    #[ignore]
     fn debug() {
-        let (c, rx) = create_raft_client("test");
-        let args = RequestVoteArgs {
-            peer_id: 1,
-            term: 3,
-            last_log_index: 2,
-            last_log_term: 2,
-        };
-        c.request_vote(&args);
-        let res = get_send_rpc::<RequestVoteReply>(rx);
-
-        println!("res is {:?}", res);
-
-        let p = PersistentState::default();
-        println!("p is {:?}", p);
-        let v = VolatileState::default();
-        println!("v is {:?}", v);
+        let a = async {};
+        let b = async { block_on(a) };
+        let d = block_on(b);
     }
 
     fn get_send_rpc<T: Message>(mut rx: UnboundedReceiver<Rpc>) -> (T, UnboundedReceiver<Rpc>) {
