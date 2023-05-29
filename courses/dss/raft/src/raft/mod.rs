@@ -12,6 +12,7 @@ use log::error;
 use log::info;
 use prost::Message;
 use std::cmp::min;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::default;
@@ -239,7 +240,7 @@ impl Raft {
                         vote.reply.send(reply).expect("send vote reply error");
                     }
                     RaftEvent::VoteReply(reply_result) => {
-                        info!("{} recv vote reply ", self.me);
+                        info!("{} recv vote reply {:?}", self.me, reply_result);
                         self.handle_vote_reply(reply_result);
                     }
                     RaftEvent::Append(request, reply) => self.handle_append(request, reply),
@@ -328,55 +329,79 @@ impl Raft {
         self.send_vote(self.persistent_state.term);
     }
     fn handle_vote(&mut self, vote: &RequestVoteArgs) -> RequestVoteReply {
-        let mut accept = false;
-        // term is less than current term,refuse it
-        let last_entry = self.persistent_state.logs.last().unwrap();
-        let last_entry_term = last_entry.term;
-        let last_entry_index = self.persistent_state.logs.len() - 1;
-        if last_entry_term < vote.last_log_term
-            || (last_entry_term == vote.last_log_term
-                && last_entry_index as u64 <= vote.last_log_index)
-        {
-            // if term equal
-            if vote.term == self.persistent_state.term {
-                if self.volatile_state.role == Role::LEADER
-                    || self.volatile_state.role == Role::FOLLOWER
-                {
-                    if self.persistent_state.voted_for.is_none() {
-                        accept = true;
-                        info!(
-                            "accept vote from {},{} become follower",
-                            vote.peer_id, self.me
-                        );
-
-                        self.becomes_follower(vote.term, Some(vote.peer_id));
-                    } else if self.persistent_state.voted_for.unwrap() == vote.peer_id {
-                        accept = true;
-                        self.update_election_check_time_out();
-                    }
-                    // vote for not equal,refuse it
-                }
-            // if term bigger current
-            } else if vote.term > self.persistent_state.term {
-                info!(
-                    "accept vote from {},{} become follower",
-                    vote.peer_id, self.me
-                );
-                self.becomes_follower(vote.term, Some(vote.peer_id));
-                accept = true;
-            };
-        }
-        let res = RequestVoteReply {
+        let mut res = RequestVoteReply {
             peer_id: self.me as u64,
             term: self.persistent_state.term,
-            vote_granted: accept,
+            vote_granted: false,
         };
-        info!("{} current term is {}", self.me, self.persistent_state.term);
+        match vote.term.cmp(&self.persistent_state.term) {
+            // term <me refuse
+            Ordering::Less => {
+                info!(
+                    "{} receive vote {:?},but current term is {},refuse it",
+                    self.me, vote, self.persistent_state.term
+                );
+                res.vote_granted = false;
+                return res;
+            }
+            Ordering::Greater => {
+                let log_compare_res =
+                    self.compare_vote_last_entry(vote.last_log_index, vote.last_log_term);
+                if log_compare_res {
+                    res.term = vote.term;
+                    res.vote_granted = true;
+                    self.becomes_follower(vote.term, Some(vote.peer_id));
+                    info!("{} accept vote {:?},becomte follower", self.me, vote);
+                    return res;
+                } else {
+                    info!(
+                        "{} compare logs with vote last entry {:?} false, refuse vote ",
+                        self.me, vote
+                    );
+                    res.vote_granted = false;
+                    return res;
+                }
+            }
+            Ordering::Equal => {
+                res.vote_granted = false;
+                match self.persistent_state.voted_for {
+                    Some(p) => {
+                        if p == vote.peer_id {
+                            res.vote_granted = true;
+                            self.update_election_check_time_out();
+                        }
+                    }
+                    None => {}
+                }
+                return res;
+            }
+        }
+    }
+
+    fn compare_vote_last_entry(
+        &self,
+        vote_last_entry_index: u64,
+        vote_last_entry_term: u64,
+    ) -> bool {
+        let last_entry_index = self.persistent_state.logs.len() - 1;
+        let last_entry = self.persistent_state.logs.get(last_entry_index).unwrap();
+        let last_entry_term = last_entry.term;
+
         info!(
-            "{} send vote reply resp {:?} to {}",
-            self.me, res, vote.peer_id
+            "{} last entry index is {},last entry term is {}",
+            self.me, last_entry_index, last_entry_term
         );
-        return res;
+
+        let res = match last_entry_term.cmp(&vote_last_entry_term) {
+            Ordering::Equal => match last_entry_index.cmp(&(vote_last_entry_index as usize)) {
+                Ordering::Less => true,
+                Ordering::Equal => true,
+                Ordering::Greater => false,
+            },
+            Ordering::Greater => false,
+            Ordering::Less => true,
+        };
+        res
     }
 
     fn handle_vote_reply(&mut self, reply: RequestVoteReply) {
@@ -1420,7 +1445,7 @@ pub mod my_tests {
         n.send_event(RaftEvent::Vote(super::VoteRequestEvent {
             request: RequestVoteArgs {
                 peer_id: 4,
-                term: 3,
+                term: 0,
                 last_log_index: 2,
                 last_log_term: 2,
             },
@@ -1716,7 +1741,7 @@ pub mod my_tests {
         let node = Node::new_wiht_timer_and_role(r, false, Role::CANDIDATOR);
         let state = node.get_state();
         let old_term = state.p_state.term;
-        let new_term=old_term+1;
+        let new_term = old_term + 1;
         node.send_event(RaftEvent::VoteReply(RequestVoteReply {
             term: new_term,
             vote_granted: false,
@@ -1724,11 +1749,40 @@ pub mod my_tests {
         }));
 
         let state = node.get_state();
-        assert_eq!(state.v_state.role,Role::FOLLOWER);
-        assert_eq!(state.p_state.term,new_term);
+        assert_eq!(state.v_state.role, Role::FOLLOWER);
+        assert_eq!(state.p_state.term, new_term);
+    }
+    #[test]
+    fn test_compare_logs_with_vote() {
+        let mut r = create_raft_with_client(vec![], 0);
+        let logs = &mut r.persistent_state.logs;
+        // same term and index
+        logs.clear();
+        logs.push(Entry {
+            data: vec![],
+            term: 0,
+        });
+        logs.push(Entry {
+            data: vec![],
+            term: 1,
+        });
+        logs.push(Entry {
+            data: vec![],
+            term: 2,
+        });
+        logs.push(Entry {
+            data: vec![],
+            term: 2,
+        });
 
-
-
+        // same term,same index
+        assert!(r.compare_vote_last_entry(3, 2));
+        // same term,bigger index
+        assert!(!r.compare_vote_last_entry(2, 2));
+        // bigger term
+        assert!(!r.compare_vote_last_entry(2, 1));
+        // smaller term
+        assert!(r.compare_vote_last_entry(2, 3));
     }
     #[test]
     #[ignore]
