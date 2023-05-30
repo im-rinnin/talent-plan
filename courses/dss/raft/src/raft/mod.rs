@@ -196,6 +196,7 @@ impl Raft {
 
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
+        assert!(rf.persistent_state.term >= rf.last_log_term());
 
         rf
     }
@@ -276,7 +277,7 @@ impl Raft {
         match role {
             Role::CANDIDATOR => self.becomes_candidate(),
             Role::LEADER => self.become_leader(),
-            Role::FOLLOWER => self.becomes_follower(0, None),
+            Role::FOLLOWER => self.becomes_follower(self.persistent_state.term, None),
         };
         let _ = thread::spawn(move || self.main());
         res
@@ -295,9 +296,12 @@ impl Raft {
 
         self.update_election_check_time_out();
         self.set_up_election_timeout_checker();
+
+        self.save_persist_state();
     }
 
     fn becomes_follower(&mut self, term: u64, vote_for: Option<u64>) {
+        assert!(term >= self.persistent_state.term);
         // change role to follower
         self.volatile_state.role = Role::FOLLOWER;
         // update term
@@ -306,6 +310,7 @@ impl Raft {
         // update election timeout
         self.update_election_check_time_out();
         self.set_up_election_timeout_checker();
+        self.save_persist_state();
     }
 
     fn handle_election_timeout(&mut self, instant: u64, term: u64) {
@@ -325,7 +330,6 @@ impl Raft {
         //  update state
         self.becomes_candidate();
 
-        self.save_persist_state();
         self.send_vote(self.persistent_state.term);
     }
     fn handle_vote(&mut self, vote: &RequestVoteArgs) -> RequestVoteReply {
@@ -358,6 +362,7 @@ impl Raft {
                         "{} compare logs with vote last entry {:?} false, refuse vote ",
                         self.me, vote
                     );
+                    self.becomes_follower(vote.term, None);
                     res.vote_granted = false;
                     return res;
                 }
@@ -426,7 +431,6 @@ impl Raft {
             self.volatile_state.vote_record.insert(reply.peer_id);
             if self.volatile_state.vote_record.len() >= self.peers.len() / 2 + 1 {
                 self.become_leader();
-                self.save_persist_state();
                 self.send_append_to_all_client();
             }
         }
@@ -528,7 +532,7 @@ impl Raft {
             }
         } else {
             info!(
-                "accept append from {},term is bigger or more than me, {} become follower",
+                "accept append from {},term is eq or more than me, {} become follower",
                 args.leader_id, self.me
             );
             self.becomes_follower(args.term, None);
@@ -606,8 +610,9 @@ impl Raft {
                 term: self.persistent_state.term,
             };
             self.persistent_state.logs.push(entry);
-            self.send_append_to_all_client();
             self.volatile_state.last_send_append_time = system_time_now_epoch();
+            self.save_persist_state();
+            self.send_append_to_all_client();
 
             reply
                 .send(ClientCommandReply {
@@ -644,6 +649,7 @@ impl Raft {
             self.volatile_state.match_index.insert(id as u64, 0);
         }
         self.volatile_state.last_send_append_time = system_time_now_epoch();
+        self.save_persist_state();
     }
     fn set_up_heartbeat_timer(&mut self) {
         if self.disable_timer {
@@ -899,6 +905,7 @@ impl Raft {
     }
 
     pub fn save_persist_state(&mut self) {
+        assert!(self.persistent_state.term >= self.last_log_term() );
         info!("{} save persiste state", self.me);
         let mut data = Vec::new();
         self.persistent_state
@@ -1438,6 +1445,7 @@ pub mod my_tests {
             data: vec![1],
             term: 2,
         });
+        r.persistent_state.term = 2;
 
         let n = Node::new_disable_timer(r);
 
