@@ -245,8 +245,12 @@ impl Raft {
                         self.handle_vote_reply(reply_result);
                     }
                     RaftEvent::Append(request, reply) => self.handle_append(request, reply),
-                    RaftEvent::AppendReply { reply, peer_id } => {
-                        self.handle_append_reply(reply, peer_id);
+                    RaftEvent::AppendReply {
+                        reply,
+                        peer_id,
+                        match_index,
+                    } => {
+                        self.handle_append_reply(reply, peer_id, match_index);
                     }
                     RaftEvent::ReadState(reply) => {
                         reply
@@ -435,7 +439,7 @@ impl Raft {
             }
         }
     }
-    fn handle_append_reply(&mut self, reply: AppendReply, peer_id: u64) {
+    fn handle_append_reply(&mut self, reply: AppendReply, peer_id: u64, match_index: u64) {
         // validate reply
         if self.volatile_state.role != Role::LEADER {
             info!(
@@ -454,9 +458,9 @@ impl Raft {
             if reply.success {
                 // update next_index
                 let next_index = self.volatile_state.next_index.get_mut(&peer_id).unwrap();
-                *next_index = reply.match_index + 1;
-                let match_index = self.volatile_state.match_index.get_mut(&peer_id).unwrap();
-                *match_index = reply.match_index;
+                *next_index = match_index + 1;
+                let peer_match_index = self.volatile_state.match_index.get_mut(&peer_id).unwrap();
+                *peer_match_index = match_index;
                 //  update commit index
                 // add this node log last index
                 let mut match_indexs = vec![(self.persistent_state.logs.len() - 1) as u64];
@@ -518,7 +522,7 @@ impl Raft {
         }
     }
 
-    fn handle_append(&mut self, args: AppendArgs, reply_ch: oneshot::Sender<Result<AppendReply>>) {
+    fn handle_append(&mut self, args: AppendArgs, reply_ch: oneshot::Sender<AppendReply>) {
         // validate term
         let reply = if args.term < self.persistent_state.term {
             info!(
@@ -528,7 +532,6 @@ impl Raft {
             AppendReply {
                 term: self.persistent_state.term,
                 success: false,
-                match_index: 0,
             }
         } else {
             info!(
@@ -547,11 +550,29 @@ impl Raft {
                 info!("prev entry not match,refuse append,index is {}, entry term is {}, args prev log term is {}",args.prev_log_index, logs[args.prev_log_index as usize].term ,args.term)
             } else {
                 accept = true;
-                while logs.len() - 1 > args.prev_log_index as usize {
-                    logs.pop();
+                // check first entry conflict
+                let mut log_index = args.prev_log_index + 1;
+                let mut index_in_append_args = 0;
+                while log_index <= max_index && index_in_append_args < args.entrys.len() {
+                    let term = logs
+                        .get(log_index as usize)
+                        .expect("error to get entry")
+                        .term;
+                    let append_term =
+                        labcodec::decode::<Entry>(args.entrys.get(index_in_append_args).unwrap())
+                            .unwrap()
+                            .term;
+                    if term != append_term {
+                        // discard entry start from conflict entry
+                        logs.truncate(log_index as usize);
+                        break;
+                    }
+                    log_index += 1;
+                    index_in_append_args += 1;
                 }
-                for data in args.entrys {
-                    let entry = labcodec::decode::<Entry>(&data).expect("decode entry error");
+                // append entry from conflict entry or from rest append entry
+                for i in index_in_append_args..args.entrys.len() {
+                    let entry = labcodec::decode::<Entry>(args.entrys.get(i).unwrap()).unwrap();
                     logs.push(entry);
                 }
 
@@ -586,13 +607,12 @@ impl Raft {
             AppendReply {
                 term: self.persistent_state.term,
                 success: accept,
-                match_index: (self.persistent_state.logs.len() - 1) as u64,
             }
         };
 
         info!("{} send append reply {:?}", self.me, reply);
         reply_ch
-            .send(Ok(reply))
+            .send(reply)
             .expect("send append reply to chan failed");
     }
     fn handle_command(&mut self, data: Vec<u8>, reply: Sender<ClientCommandReply>) {
@@ -709,7 +729,12 @@ impl Raft {
             .get(&(peer_id as u64))
             .expect("get match index fail");
 
-        assert!(*next_index <= self.persistent_state.logs.len() as u64);
+        assert!(
+            *next_index <= self.persistent_state.logs.len() as u64,
+            "next index is {},len is {}",
+            *next_index,
+            self.persistent_state.logs.len()
+        );
 
         let mut entrys = vec![];
         for i in (*next_index as usize)..self.persistent_state.logs.len() {
@@ -741,9 +766,12 @@ impl Raft {
                     return;
                 }
                 Ok(reply) => {
+                    let match_index =
+                        append_request.prev_log_index + append_request.entrys.len() as u64;
                     let res = tx.send(RaftEvent::AppendReply {
                         reply,
                         peer_id: peer_id as u64,
+                        match_index,
                     });
                     if res.is_err() {
                         warn!("send heartbeat append request failed {:?}", res);
@@ -905,7 +933,7 @@ impl Raft {
     }
 
     pub fn save_persist_state(&mut self) {
-        assert!(self.persistent_state.term >= self.last_log_term() );
+        assert!(self.persistent_state.term >= self.last_log_term());
         info!("{} save persiste state", self.me);
         let mut data = Vec::new();
         self.persistent_state
@@ -941,10 +969,12 @@ enum RaftEvent {
     // (checkout_time,term)
     CheckElectionTimeOut(u64, u64),
     HeartBeatTimeOut(),
-    Append(AppendArgs, oneshot::Sender<Result<AppendReply>>),
+    Append(AppendArgs, oneshot::Sender<AppendReply>),
     AppendReply {
         reply: AppendReply,
         peer_id: u64,
+        // if append success, leader should update match index to this
+        match_index: u64,
     },
     VoteReply(RequestVoteReply),
     Vote(VoteRequestEvent),
@@ -1162,10 +1192,8 @@ impl RaftService for Node {
 
             let t = rx.await;
             match t {
-                Ok(res) => match res {
-                    Ok(r) => labrpc::Result::Ok(r),
-                    Err(e) => labrpc::Result::Err(labrpc::Error::Other(e.to_string())),
-                },
+                Ok(res) => labrpc::Result::Ok(res),
+                // Err(e) => labrpc::Result::Err(labrpc::Error::Other(e.to_string())),
                 Err(e) => labrpc::Result::Err(labrpc::Error::Other(e.to_string())),
             }
         }
@@ -1212,7 +1240,7 @@ pub mod my_tests {
     use crate::{
         proto::{kvraftpb::GetReply, raftpb::RequestVoteReply},
         raft::{
-            RaftEvent, Role, State, VolatileState, ELECTION_TIMEOUT_MIN_TIME,
+            RaftEvent, Role, State,  ELECTION_TIMEOUT_MIN_TIME,
             ELECTION_TIMEOUT_RANGE,
         },
     };
@@ -1476,7 +1504,7 @@ pub mod my_tests {
         let term = state.p_state.term;
         let old_check_time = state.v_state.time_to_check_election_time_out;
 
-        let (tx, rx) = oneshot::channel::<super::Result<AppendReply>>();
+        let (tx, rx) = oneshot::channel::<AppendReply>();
 
         n.send_event(RaftEvent::Append(
             AppendArgs {
@@ -1504,8 +1532,8 @@ pub mod my_tests {
         let mut r = create_raft_with_client(vec![c], me);
         let term = 1;
         let leader_id = 1;
-        r.becomes_follower(term, None);
-        let n = Node::new_disable_timer(r);
+        r.persistent_state.term = term;
+        let n = Node::new_wiht_timer_and_role(r, false, Role::FOLLOWER);
         let store_data = vec![1, 2, 3];
 
         // [x] append 接受term
@@ -1525,9 +1553,10 @@ pub mod my_tests {
             leader_commit: leader_id,
             entrys: vec![data],
         };
-        let (tx, rx) = oneshot::channel::<super::Result<AppendReply>>();
+        let (tx, rx) = oneshot::channel();
         n.send_event(RaftEvent::Append(append_request, tx));
-        // let reply = block_on(async { rx.into_future().await }).unwrap();
+        let reply = block_on(async { rx.into_future().await }).unwrap();
+        assert!(reply.success);
 
         let state = n.get_state();
         let log = &state.p_state.logs;
@@ -1548,10 +1577,10 @@ pub mod my_tests {
             entrys: vec![],
         };
 
-        let (tx, mut rx) = oneshot::channel::<super::Result<AppendReply>>();
+        let (tx, mut rx) = oneshot::channel();
         n.send_event(RaftEvent::Append(append_request, tx));
 
-        let res = block_on(async { rx.await }).unwrap().unwrap();
+        let res = block_on(async { rx.await }).unwrap();
         assert_eq!(res.success, false);
         assert_eq!(res.term, term);
 
@@ -1564,10 +1593,10 @@ pub mod my_tests {
             leader_commit: leader_id,
             entrys: vec![],
         };
-        let (tx, mut rx) = oneshot::channel::<super::Result<AppendReply>>();
+        let (tx, mut rx) = oneshot::channel::<AppendReply>();
         n.send_event(RaftEvent::Append(append_request, tx));
 
-        let res = block_on(async { rx.await }).unwrap().unwrap();
+        let res = block_on(async { rx.await }).unwrap();
         assert_eq!(res.success, false);
         assert_eq!(res.term, term);
         // append 截断 follower
@@ -1587,9 +1616,9 @@ pub mod my_tests {
             leader_commit: leader_id,
             entrys,
         };
-        let (tx, mut rx) = oneshot::channel::<super::Result<AppendReply>>();
+        let (tx, mut rx) = oneshot::channel();
         n.send_event(RaftEvent::Append(append_request, tx));
-        let res = block_on(async { rx.await }).unwrap().unwrap();
+        let res = block_on(async { rx.await }).unwrap();
         assert_eq!(res.success, true);
         assert_eq!(res.term, term);
 
@@ -1674,9 +1703,9 @@ pub mod my_tests {
             reply: AppendReply {
                 term: term,
                 success: true,
-                match_index: 1,
             },
             peer_id: 0,
+            match_index: 1,
         });
         let state = n.get_state();
         assert_eq!(state.v_state.commit_index, 1);
@@ -1721,9 +1750,9 @@ pub mod my_tests {
             reply: AppendReply {
                 term: 2,
                 success: true,
-                match_index: 1,
             },
             peer_id: 0,
+            match_index: 1,
         });
 
         let s = n.get_state();
@@ -1734,9 +1763,9 @@ pub mod my_tests {
             reply: AppendReply {
                 term: 2,
                 success: true,
-                match_index: 2,
             },
             peer_id: 0,
+            match_index: 2,
         });
         let s = n.get_state();
         assert_eq!(s.p_state.logs.len(), 3);
@@ -1766,22 +1795,10 @@ pub mod my_tests {
         let logs = &mut r.persistent_state.logs;
         // same term and index
         logs.clear();
-        logs.push(Entry {
-            data: vec![],
-            term: 0,
-        });
-        logs.push(Entry {
-            data: vec![],
-            term: 1,
-        });
-        logs.push(Entry {
-            data: vec![],
-            term: 2,
-        });
-        logs.push(Entry {
-            data: vec![],
-            term: 2,
-        });
+        log_append_entry_with_term(logs, 0);
+        log_append_entry_with_term(logs, 1);
+        log_append_entry_with_term(logs, 2);
+        log_append_entry_with_term(logs, 2);
 
         // same term,same index
         assert!(r.compare_vote_last_entry(3, 2));
@@ -1791,6 +1808,162 @@ pub mod my_tests {
         assert!(!r.compare_vote_last_entry(2, 1));
         // smaller term
         assert!(r.compare_vote_last_entry(2, 3));
+    }
+    #[test]
+    fn test_follower_append_log() {
+        let mut r = create_raft_with_client(vec![], 0);
+        r.persistent_state.term = 2;
+
+        // prev entry not exits
+        let logs = &mut r.persistent_state.logs;
+        // log term is [0,1,2]
+        logs.clear();
+        log_append_entry_with_term(logs, 0);
+        log_append_entry_with_term(logs, 1);
+        log_append_entry_with_term(logs, 2);
+
+        let n = Node::new_disable_timer(r);
+        let (tx, rx) = oneshot::channel();
+        let mut args = AppendArgs {
+            leader_id: 1,
+            term: 2,
+            prev_log_index: 3,
+            prev_log_term: 4,
+            leader_commit: 0,
+            entrys: vec![],
+        };
+        n.send_event(RaftEvent::Append(args.clone(), tx));
+        let rpc = block_on(async { rx.await }).unwrap();
+        assert_eq!(rpc.success, false);
+
+        // prev entry term not match
+
+        let (tx, rx) = oneshot::channel();
+        args.prev_log_index = 2;
+        args.prev_log_term = 3;
+        n.send_event(RaftEvent::Append(args.clone(), tx));
+        let rpc = block_on(async { rx.await }).unwrap();
+        assert_eq!(rpc.success, false);
+
+        // prev entry match,prev entry is last entry
+        // logs: [0,1,2] append prev entry index is 2,term is 2
+
+        let (tx, rx) = oneshot::channel();
+        args.prev_log_index = 2;
+        args.prev_log_term = 2;
+        n.send_event(RaftEvent::Append(args.clone(), tx));
+        let rpc: AppendReply = block_on(async { rx.await }).unwrap();
+        assert_eq!(rpc.success, true);
+
+        // prev entry match,prev entry is second entry,no data in append,logs won't change
+        // logs: [0,1,2] append prev entry index is 1,term is 1
+
+        let (tx, rx) = oneshot::channel();
+        args.prev_log_index = 1;
+        args.prev_log_term = 1;
+        n.send_event(RaftEvent::Append(args.clone(), tx));
+        let rpc: AppendReply = block_on(async { rx.await }).unwrap();
+        assert_eq!(rpc.success, true);
+        let s = n.get_state();
+        assert_eq!(s.p_state.logs.len(), 3);
+
+        // prev entry match, some entry after prev entry not match entry in append, discard all conflict entry
+        // logs: [0,1,2,2,3] append match in index 2,append data is [2,4,5] after appned should be [0,1,2,2,4,5]
+
+        let mut r = create_raft_with_client(vec![], 0);
+        r.persistent_state.term = 3;
+
+        let logs = &mut r.persistent_state.logs;
+        logs.clear();
+        log_append_entry_with_term(logs, 0);
+        log_append_entry_with_term(logs, 1);
+        log_append_entry_with_term(logs, 2);
+        log_append_entry_with_term(logs, 2);
+        log_append_entry_with_term(logs, 3);
+        let n = Node::new_disable_timer(r);
+
+        let (tx, rx) = oneshot::channel();
+        let datas = vec![
+            build_entry_with_term(2),
+            build_entry_with_term(4),
+            build_entry_with_term(5),
+        ];
+
+        let args = AppendArgs {
+            leader_id: 1,
+            term: 5,
+            prev_log_index: 2,
+            prev_log_term: 2,
+            leader_commit: 0,
+            entrys: datas,
+        };
+        n.send_event(RaftEvent::Append(args, tx));
+        let rpc: AppendReply = block_on(async { rx.await }).unwrap();
+        assert_eq!(rpc.success, true);
+        let s = n.get_state();
+        assert_eq!(s.p_state.logs.len(), 6);
+        assert_eq!(s.p_state.logs.get(0).unwrap().term, 0);
+        assert_eq!(s.p_state.logs.get(1).unwrap().term, 1);
+        assert_eq!(s.p_state.logs.get(2).unwrap().term, 2);
+        assert_eq!(s.p_state.logs.get(3).unwrap().term, 2);
+        assert_eq!(s.p_state.logs.get(4).unwrap().term, 4);
+        assert_eq!(s.p_state.logs.get(5).unwrap().term, 5);
+
+        // prev entry match, entry after prev entry match entry in append,nothing hanpped
+        // logs: [0,1,2,2,2,3] append match in index 2,append data is [2,2]
+
+        let mut r = create_raft_with_client(vec![], 0);
+        r.persistent_state.term = 3;
+
+        let logs = &mut r.persistent_state.logs;
+        logs.clear();
+        log_append_entry_with_term(logs, 0);
+        log_append_entry_with_term(logs, 1);
+        log_append_entry_with_term(logs, 2);
+        log_append_entry_with_term(logs, 2);
+        log_append_entry_with_term(logs, 2);
+        log_append_entry_with_term(logs, 3);
+        let n = Node::new_disable_timer(r);
+
+        let (tx, rx) = oneshot::channel();
+        let datas = vec![build_entry_with_term(2), build_entry_with_term(2)];
+
+        let args = AppendArgs {
+            leader_id: 1,
+            term: 5,
+            prev_log_index: 2,
+            prev_log_term: 2,
+            leader_commit: 0,
+            entrys: datas,
+        };
+        n.send_event(RaftEvent::Append(args, tx));
+        let rpc: AppendReply = block_on(async { rx.await }).unwrap();
+        assert_eq!(rpc.success, true);
+        let s = n.get_state();
+        assert_eq!(s.p_state.logs.len(), 6);
+        assert_eq!(s.p_state.logs.get(0).unwrap().term, 0);
+        assert_eq!(s.p_state.logs.get(1).unwrap().term, 1);
+        assert_eq!(s.p_state.logs.get(2).unwrap().term, 2);
+        assert_eq!(s.p_state.logs.get(3).unwrap().term, 2);
+        assert_eq!(s.p_state.logs.get(4).unwrap().term, 2);
+        assert_eq!(s.p_state.logs.get(5).unwrap().term, 3);
+    }
+
+    fn log_append_entry_with_term(logs: &mut Vec<Entry>, term: u64) {
+        logs.push(Entry {
+            data: vec![],
+            term: term,
+        });
+    }
+
+    fn build_entry_with_term(term: u64) -> Vec<u8> {
+        let mut data = vec![];
+        let entry = Entry {
+            data: vec![],
+            term: term,
+        };
+        labcodec::encode(&entry, &mut data).unwrap();
+        data
     }
     #[test]
     #[ignore]
