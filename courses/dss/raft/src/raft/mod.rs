@@ -151,6 +151,8 @@ pub struct Raft {
     // other state
     rx: Receiver<RaftEvent>,
     tx: Sender<RaftEvent>,
+    // (checkout_time,term)
+    election_time_out_tx: Sender<(u64, u64)>,
     apply_tx: UnboundedSender<ApplyMsg>,
     disable_timer: bool, // Your data here (2A, 2B, 2C).
                          // Look at the paper's Figure 2 for a description of what
@@ -180,6 +182,7 @@ impl Raft {
             data: vec![],
             term: 0,
         });
+        let (election_tx, election_rx) = crossbeam_channel::unbounded();
 
         // Your initialization code here (2A, 2B, 2C).
         let mut rf = Raft {
@@ -192,7 +195,10 @@ impl Raft {
             tx: tx,
             apply_tx: apply_ch,
             disable_timer: false,
+            election_time_out_tx: election_tx,
         };
+
+        rf.set_up_election_timeout_checker(election_rx);
 
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
@@ -209,6 +215,9 @@ impl Raft {
         let start = system_time_now_epoch();
         let check_time = start + Self::random_timeout().as_millis() as u64;
         self.volatile_state.time_to_check_election_time_out = check_time;
+        self.election_time_out_tx
+            .send((check_time, self.persistent_state.term))
+            .unwrap();
         info!(
             "{} set election timeout check time to {}",
             self.me, check_time
@@ -300,7 +309,6 @@ impl Raft {
         self.volatile_state.vote_record.insert(self.me as u64);
 
         self.update_election_check_time_out();
-        self.set_up_election_timeout_checker();
 
         self.save_persist_state();
     }
@@ -314,7 +322,6 @@ impl Raft {
         self.persistent_state.voted_for = vote_for;
         // update election timeout
         self.update_election_check_time_out();
-        self.set_up_election_timeout_checker();
         self.save_persist_state();
     }
 
@@ -327,7 +334,6 @@ impl Raft {
         }
         if self.volatile_state.time_to_check_election_time_out != instant {
             info!("{} elclection timeout check pass", self.me);
-            self.set_up_election_timeout_checker();
             return;
         }
         info!("{} elclection timeout,start election", self.me);
@@ -699,29 +705,60 @@ impl Raft {
         });
     }
 
-    fn set_up_election_timeout_checker(&mut self) {
+    fn set_up_election_timeout_checker(&mut self, check_time_rx: Receiver<(u64, u64)>) {
         if self.disable_timer {
             return;
         }
-        let check_time = self.volatile_state.time_to_check_election_time_out;
-        let now = system_time_now_epoch();
-        let duration = if check_time > now {
-            check_time - now
-        } else {
-            0
-        };
 
-        info!(
-            "{} set next time out check after {} ms in {}",
-            self.me, duration, check_time
-        );
         let tx = self.tx.clone();
-        let term = self.persistent_state.term;
         let _join = spawn(move || {
-            thread::sleep(Duration::from_millis(duration));
-            tx.send(RaftEvent::CheckElectionTimeOut(check_time, term))
-                .expect("send time out check error");
-            debug!("send time out check event");
+            loop {
+                // wait for rx
+                // get all from rx , use last one
+                // sleep and send event
+                // loop from begin
+                let mut check_time;
+                let mut term;
+                let res = check_time_rx.recv();
+                match res {
+                    Ok((c, t)) => {
+                        check_time = c;
+                        term = t;
+                    }
+                    Err(e) => {
+                        info!("election recv error{:?},return", e);
+                        break;
+                    }
+                }
+                while !check_time_rx.is_empty() {
+                    let res = check_time_rx.try_recv();
+                    match res {
+                        Ok((c, t)) => {
+                            check_time = c;
+                            term = t;
+                        }
+                        Err(e) => {
+                            info!("election recv error{:?},return", e);
+                            break;
+                        }
+                    }
+                }
+
+                let now = system_time_now_epoch();
+                let duration = if check_time > now {
+                    check_time - now
+                } else {
+                    0
+                };
+
+                info!(
+                    " set next time out check after {} ms in {}",
+                    duration, check_time
+                );
+                thread::sleep(Duration::from_millis(duration));
+                tx.send(RaftEvent::CheckElectionTimeOut(check_time, term))
+                    .expect("send time out check error");
+            }
         });
     }
     fn entry_term(&self, index: usize) -> u64 {
