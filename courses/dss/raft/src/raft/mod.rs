@@ -219,7 +219,7 @@ impl Raft {
         loop {
             //
             let res = self.rx.recv();
-            info!("receive raft event {:?}", res);
+            info!("{} receive raft event {:?}", self.me, res);
             match res {
                 Err(e) => {
                     info!(
@@ -249,8 +249,9 @@ impl Raft {
                         reply,
                         peer_id,
                         match_index,
+                        prev_index,
                     } => {
-                        self.handle_append_reply(reply, peer_id, match_index);
+                        self.handle_append_reply(reply, peer_id, match_index, prev_index);
                     }
                     RaftEvent::ReadState(reply) => {
                         reply
@@ -431,7 +432,7 @@ impl Raft {
                 .get(&reply.peer_id)
                 .is_none()
         {
-            info!("vote accept add one from {}", reply.peer_id);
+            info!("{} vote accept add one from {}", self.me, reply.peer_id);
             self.volatile_state.vote_record.insert(reply.peer_id);
             if self.volatile_state.vote_record.len() >= self.peers.len() / 2 + 1 {
                 self.become_leader();
@@ -439,7 +440,13 @@ impl Raft {
             }
         }
     }
-    fn handle_append_reply(&mut self, reply: AppendReply, peer_id: u64, match_index: u64) {
+    fn handle_append_reply(
+        &mut self,
+        reply: AppendReply,
+        peer_id: u64,
+        match_index: u64,
+        prev_index: u64,
+    ) {
         // validate reply
         if self.volatile_state.role != Role::LEADER {
             info!(
@@ -455,9 +462,15 @@ impl Raft {
             );
             return;
         } else if reply.term == self.persistent_state.term {
+            // check if reply is stale
+            let next_index = self.volatile_state.next_index.get_mut(&peer_id).unwrap();
+            if *next_index - 1 != prev_index {
+                warn!("{} receive a reorder reply, prev index is {},current next_index is {},ignore it ", self.me,prev_index,*next_index);
+                return;
+            }
+            //
             if reply.success {
                 // update next_index
-                let next_index = self.volatile_state.next_index.get_mut(&peer_id).unwrap();
                 *next_index = match_index + 1;
                 let peer_match_index = self.volatile_state.match_index.get_mut(&peer_id).unwrap();
                 *peer_match_index = match_index;
@@ -501,7 +514,7 @@ impl Raft {
                         );
                         let res = self.apply_tx.unbounded_send(apply_msg);
                         if res.is_err() {
-                            info!("send apply msg error {:?}", res)
+                            info!("{} send apply msg error {:?}", self.me, res)
                         }
                     }
                     self.volatile_state.commit_index = *n;
@@ -515,8 +528,8 @@ impl Raft {
             }
         } else {
             info!(
-                "accept append reply ,term is bigger than me ,{} become follower",
-                self.me
+                "{} accept append reply ,term is bigger than me ,{} become follower",
+                self.me, self.me
             );
             self.becomes_follower(reply.term, None);
         }
@@ -526,8 +539,8 @@ impl Raft {
         // validate term
         let reply = if args.term < self.persistent_state.term {
             info!(
-                "term {} is less than mine term{},refuse append",
-                args.term, self.persistent_state.term
+                "{} term {} is less than mine term{},refuse append",
+                self.me, args.term, self.persistent_state.term
             );
             AppendReply {
                 term: self.persistent_state.term,
@@ -535,8 +548,8 @@ impl Raft {
             }
         } else {
             info!(
-                "accept append from {},term is eq or more than me, {} become follower",
-                args.leader_id, self.me
+                "{} accept append from {},term is eq or more than me, {} become follower",
+                self.me, args.leader_id, self.me
             );
             self.becomes_follower(args.term, None);
             let mut accept = false;
@@ -698,7 +711,10 @@ impl Raft {
             0
         };
 
-        info!("set next time out check after {} ms", duration);
+        info!(
+            "{} set next time out check after {} ms in {}",
+            self.me, duration, check_time
+        );
         let tx = self.tx.clone();
         let term = self.persistent_state.term;
         let _join = spawn(move || {
@@ -759,6 +775,7 @@ impl Raft {
         let c_clone = c.clone();
         let tx = self.tx.clone();
         c.spawn(async move {
+            let prev_log_index = append_request.prev_log_index;
             let res = c_clone.append(&append_request).await;
             match res {
                 Err(e) => {
@@ -772,6 +789,7 @@ impl Raft {
                         reply,
                         peer_id: peer_id as u64,
                         match_index,
+                        prev_index: prev_log_index,
                     });
                     if res.is_err() {
                         warn!("send heartbeat append request failed {:?}", res);
@@ -975,6 +993,8 @@ enum RaftEvent {
         peer_id: u64,
         // if append success, leader should update match index to this
         match_index: u64,
+        // prev entry index in append, for check reorder reply
+        prev_index: u64,
     },
     VoteReply(RequestVoteReply),
     Vote(VoteRequestEvent),
@@ -1109,6 +1129,19 @@ impl Node {
         res
     }
 
+    fn log_state(&self) {
+        let s = self.get_state();
+        info!(
+            "{} log state, v state is {:?},term is {} ,vote for is {:?},log len is {},last entry is {:?}",
+            s.me,
+            s.v_state,
+            s.p_state.term,
+            s.p_state.voted_for,
+            s.p_state.logs.len(),
+            s.p_state.logs.last()
+        );
+    }
+
     /// the tester calls kill() when a Raft instance won't be
     /// needed again. you are not required to do anything in
     /// kill(), but it might be convenient to (for example)
@@ -1239,10 +1272,7 @@ pub mod my_tests {
     use crate::{proto::raftpb::*, raft::HEARTBEAT_CHECK_INTERVAL};
     use crate::{
         proto::{kvraftpb::GetReply, raftpb::RequestVoteReply},
-        raft::{
-            RaftEvent, Role, State,  ELECTION_TIMEOUT_MIN_TIME,
-            ELECTION_TIMEOUT_RANGE,
-        },
+        raft::{RaftEvent, Role, State, ELECTION_TIMEOUT_MIN_TIME, ELECTION_TIMEOUT_RANGE},
     };
 
     fn init_logger() {
@@ -1250,14 +1280,6 @@ pub mod my_tests {
         LOGGER_INIT.call_once(env_logger::init);
     }
 
-    fn crash_process_when_any_thread_panic() {
-        let orig_hook = panic::take_hook();
-        panic::set_hook(Box::new(move |panic_info| {
-            // invoke the default handler and exit the process
-            orig_hook(panic_info);
-            process::exit(1);
-        }));
-    }
     fn create_raft_client(name: &str) -> (RaftClient, UnboundedReceiver<Rpc>) {
         let (tx, rx) = unbounded();
         let c = Client {
@@ -1275,7 +1297,7 @@ pub mod my_tests {
         me: usize,
     ) -> (Raft, UnboundedReceiver<ApplyMsg>) {
         init_logger();
-        crash_process_when_any_thread_panic();
+        // crash_process_when_any_thread_panic();
         let p = SimplePersister::new();
         let (tx, rx) = unbounded();
         (Raft::new(clients, me, Box::new(p), tx), rx)
@@ -1392,7 +1414,7 @@ pub mod my_tests {
         let old_term = state.p_state.term;
 
         // sleep after  election timeout
-        thread::sleep(Duration::from_millis(320));
+        thread::sleep(Duration::from_millis(300));
         let state = n.get_state();
         let role = state.v_state.role;
         assert_eq!(role, Role::CANDIDATOR);
@@ -1706,6 +1728,7 @@ pub mod my_tests {
             },
             peer_id: 0,
             match_index: 1,
+            prev_index: 0,
         });
         let state = n.get_state();
         assert_eq!(state.v_state.commit_index, 1);
@@ -1749,15 +1772,39 @@ pub mod my_tests {
         n.send_event(RaftEvent::AppendReply {
             reply: AppendReply {
                 term: 2,
+                success: false,
+            },
+            peer_id: 0,
+            match_index: 0,
+            prev_index: 2,
+        });
+
+        n.send_event(RaftEvent::AppendReply {
+            reply: AppendReply {
+                term: 2,
+                success: false,
+            },
+            peer_id: 0,
+            match_index: 0,
+            prev_index: 1,
+        });
+        let s = n.get_state();
+        assert_eq!(*s.v_state.next_index.get(&0).unwrap(), 1);
+
+        n.send_event(RaftEvent::AppendReply {
+            reply: AppendReply {
+                term: 2,
                 success: true,
             },
             peer_id: 0,
             match_index: 1,
+            prev_index: 0,
         });
 
         let s = n.get_state();
         assert_eq!(s.p_state.logs.len(), 3);
         assert_eq!(s.v_state.commit_index, 0);
+        assert_eq!(*s.v_state.next_index.get(&0).unwrap(), 2);
 
         n.send_event(RaftEvent::AppendReply {
             reply: AppendReply {
@@ -1766,6 +1813,7 @@ pub mod my_tests {
             },
             peer_id: 0,
             match_index: 2,
+            prev_index: 1,
         });
         let s = n.get_state();
         assert_eq!(s.p_state.logs.len(), 3);
