@@ -30,6 +30,9 @@ message AppendArgs {
 message AppendReply {
     uint64 term = 1;
     bool success = 2;
+    uint64 conflict_entry_term_first_index=3;
+    uint64 conflict_entry_term=4;
+    uint64 logs_len=5;
 }
 message MessageForTest {
     uint64 data=1;

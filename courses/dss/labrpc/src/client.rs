@@ -5,7 +5,7 @@ use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot;
 use futures::executor::ThreadPool;
 use futures::future::{self, FutureExt};
-use log::{debug, error, warn};
+use log::{ warn};
 
 use crate::error::{Error, Result};
 use crate::server::RpcFuture;
