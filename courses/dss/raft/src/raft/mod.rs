@@ -10,6 +10,7 @@ use std::cmp::min;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::mem::swap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -35,6 +36,7 @@ use crate::proto::raftpb::*;
 const HEARTBEAT_CHECK_INTERVAL: u64 = 40;
 const ELECTION_TIMEOUT_MIN_TIME: u64 = 150;
 const ELECTION_TIMEOUT_RANGE: u64 = 150;
+const START_COMPACT_LOG_SIZE: u64 = 1000;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -67,15 +69,116 @@ pub struct Entry {
     #[prost(uint64, tag = "2")]
     term: u64,
 }
-#[derive(Clone, prost::Message)]
+
+#[derive(Clone, Message)]
+pub struct Logs {
+    #[prost(uint64, tag = "1")]
+    first_entry_index: u64,
+    #[prost(message, repeated, tag = "2")]
+    entries: Vec<Entry>,
+}
+
+#[derive(Clone, Message)]
+pub struct Snapshot {
+    // last entry term
+    #[prost(uint64, tag = "1")]
+    term: u64,
+    // last entry index
+    #[prost(uint64, tag = "2")]
+    index: u64,
+    #[prost(message, repeated, tag = "3")]
+    data: Vec<Entry>,
+}
+
+impl Snapshot {
+    // just copy log,need customer provide apply function to apply multiple entry into statemachine
+    fn new(data: Vec<Entry>, term: u64, index: u64) -> Self {
+        Snapshot { data, term, index }
+    }
+}
+
+impl Logs {
+    fn new() -> Self {
+        Logs {
+            first_entry_index: 0,
+            entries: vec![Entry {
+                data: vec![],
+                term: 0,
+            }],
+        }
+    }
+
+    // tructate to
+    fn truncate(&mut self, size: u64) {
+        self.entries.truncate(size as usize)
+    }
+    //
+    fn compact(&mut self, n: usize) -> Snapshot {
+        assert!(n > 0);
+        let mut rest = self.entries.split_off(n);
+        swap(&mut rest, &mut self.entries);
+        let last_index = self.first_entry_index + rest.len() as u64 - 1;
+        let last_term = rest.last().unwrap().term;
+        self.first_entry_index = last_index + 1;
+        Snapshot {
+            data: Vec::from(rest),
+            term: last_term,
+            index: last_index,
+        }
+    }
+
+    fn push(&mut self, entry: Entry) {
+        self.entries.push(entry)
+    }
+
+    // get any index of entry which term is
+    fn index_of_term(&mut self, term: u64) -> Option<u64> {
+        let res = self.entries.binary_search_by(|e| e.term.cmp(&term));
+        if let Ok(n) = res {
+            Some(n as u64 + self.first_entry_index)
+        } else {
+            None
+        }
+    }
+
+    fn get(&self, index: u64) -> Option<&Entry> {
+        if index < self.first_entry_index
+            || index >= self.first_entry_index + self.entries.len() as u64
+        {
+            return None;
+        }
+        self.entries.get((index - self.first_entry_index) as usize)
+    }
+    // exclude entry in snapshot
+    fn entry_in_log_len(&self) -> u64 {
+        self.entries.len() as u64
+    }
+
+    fn last_entry_index_term(&self) -> Option<(u64, u64)> {
+        if self.entries.len() > 0 {
+            return Some((
+                self.entries.len() as u64 + self.first_entry_index - 1,
+                self.entries.last().unwrap().term,
+            ));
+        } else {
+            return None;
+        }
+    }
+
+    // include entry in snapshot
+    fn len(&self) -> u64 {
+        self.first_entry_index + self.entries.len() as u64
+    }
+}
+
+#[derive(Clone, Message)]
 pub struct PersistentState {
     #[prost(uint64, tag = "1")]
     pub term: u64,
     #[prost(uint64, optional, tag = "2")]
     pub voted_for: Option<u64>,
-    #[prost(message, repeated, tag = "3")]
-    pub logs: Vec<Entry>,
-    // volatile state
+    #[prost(message, required, tag = "3")]
+    pub logs: Logs, // volatile state
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +239,7 @@ pub struct Raft {
     me: usize,
     volatile_state: VolatileState,
     persistent_state: PersistentState,
+    snapshot: Option<Snapshot>,
     // other state
     rx: Receiver<RaftEvent>,
     tx: Sender<RaftEvent>,
@@ -179,6 +283,7 @@ impl Raft {
             me,
             persistent_state: p,
             volatile_state: VolatileState::default(),
+            snapshot: None,
             rx: rx,
             tx: tx,
             apply_tx: apply_ch,
@@ -386,9 +491,7 @@ impl Raft {
         vote_last_entry_index: u64,
         vote_last_entry_term: u64,
     ) -> bool {
-        let last_entry_index = self.persistent_state.logs.len() - 1;
-        let last_entry = self.persistent_state.logs.get(last_entry_index).unwrap();
-        let last_entry_term = last_entry.term;
+        let (last_entry_index, last_entry_term) = self.last_entry_index_term();
 
         info!(
             "{} last entry index is {},last entry term is {}",
@@ -396,7 +499,7 @@ impl Raft {
         );
 
         let res = match last_entry_term.cmp(&vote_last_entry_term) {
-            Ordering::Equal => match last_entry_index.cmp(&(vote_last_entry_index as usize)) {
+            Ordering::Equal => match last_entry_index.cmp(&vote_last_entry_index) {
                 Ordering::Less => true,
                 Ordering::Equal => true,
                 Ordering::Greater => false,
@@ -483,7 +586,8 @@ impl Raft {
                 info!("{} current major match index is {} ,match indexs is {:?},current commit index is {}",self.me,*n,match_indexs,self.volatile_state.commit_index);
 
                 if *n > self.volatile_state.commit_index
-                    && self.entry_term(*n as usize) == self.persistent_state.term
+                    && self.index_term(*n as usize).expect("fail to get term in")
+                        == self.persistent_state.term
                 {
                     info!("{} update committed index to {}", self.me, *n);
                     for index in (self.volatile_state.commit_index + 1) as usize..(*n + 1) as usize
@@ -491,8 +595,8 @@ impl Raft {
                         let entry = self
                             .persistent_state
                             .logs
-                            .get(index)
-                            .expect("log index not found");
+                            .get(index as u64)
+                            .expect("index  not commit,should not be compact to snapshot");
                         let apply_msg = ApplyMsg::Command {
                             data: entry.data.clone(),
                             index: index as u64,
@@ -528,10 +632,13 @@ impl Raft {
                     let same_term_index_res = self
                         .persistent_state
                         .logs
-                        .binary_search_by(|a| a.term.cmp(&conflict_entry_term));
+                        .index_of_term(conflict_entry_term);
+                    // .persistent_state
+                    // .logs
+                    // .binary_search_by(|a| a.term.cmp(&conflict_entry_term));
                     match same_term_index_res {
                         // term found in leader
-                        Ok(mut index) => {
+                        Some(mut index) => {
                             // not same as prev term,next_index=last entry index in term
                             let last_index = {
                                 loop {
@@ -547,7 +654,7 @@ impl Raft {
                             *next_index = last_index as u64;
                         }
                         // term but not found in leader,next_index=reply.conflict_entry_term_first_index
-                        Err(_) => {
+                        None => {
                             assert!(reply.conflict_entry_term_first_index > 0);
                             assert!(reply.conflict_entry_term_first_index < *next_index);
                             *next_index = reply.conflict_entry_term_first_index;
@@ -555,7 +662,9 @@ impl Raft {
                     }
                 }
                 // resend append
+                // todo check if next_index exits
                 self.send_append_to(peer_id as usize, self.peers.get(peer_id as usize).unwrap());
+                // todo send snapshot
             }
         } else {
             info!(
@@ -592,71 +701,74 @@ impl Raft {
 
             // append/tructe log if match, or refuse log change
             let max_index = self.last_log_index() as u64;
-            let logs = &mut self.persistent_state.logs;
             if max_index < args.prev_log_index {
                 info!("prev entry not found, refuse append")
-            } else if logs[args.prev_log_index as usize].term as u64 != args.prev_log_term {
-                let entry_term = logs[args.prev_log_index as usize].term as u64;
-                info!("prev entry not match,refuse append,index is {}, entry term is {}, args prev log term is {}",args.prev_log_index, entry_term,args.term);
-                conflict_entry_term = entry_term;
-                conflict_entry_term_first_index =
-                    self.term_first_index(args.prev_log_index as usize);
             } else {
-                accept = true;
-                // check first entry conflict
-                let mut log_index = args.prev_log_index + 1;
-                let mut index_in_append_args = 0;
-                while log_index <= max_index && index_in_append_args < args.entrys.len() {
-                    let term = logs
-                        .get(log_index as usize)
-                        .expect("error to get entry")
+                let prev_index_term = self
+                    .index_term(args.prev_log_index as usize)
+                    .expect("prev index term not found in append");
+                if prev_index_term != args.prev_log_term {
+                    info!("prev entry not match,refuse append,index is {}, entry term is {}, args prev log term is {}",args.prev_log_index, prev_index_term,args.term);
+                    conflict_entry_term = prev_index_term;
+                    conflict_entry_term_first_index =
+                        self.term_first_index(args.prev_log_index as usize);
+                } else {
+                    accept = true;
+                    // check first entry conflict
+                    let mut log_index = args.prev_log_index + 1;
+                    let mut index_in_append_args = 0;
+                    while log_index <= max_index && index_in_append_args < args.entrys.len() {
+                        let term = self
+                            .index_term(log_index as usize)
+                            .expect("faill find term in append entry check");
+                        let append_term = labcodec::decode::<Entry>(
+                            args.entrys.get(index_in_append_args).unwrap(),
+                        )
+                        .unwrap()
                         .term;
-                    let append_term =
-                        labcodec::decode::<Entry>(args.entrys.get(index_in_append_args).unwrap())
-                            .unwrap()
-                            .term;
-                    if term != append_term {
-                        // discard entry start from conflict entry
-                        logs.truncate(log_index as usize);
-                        break;
+                        if term != append_term {
+                            // discard entry start from conflict entry
+                            self.persistent_state.logs.truncate(log_index);
+                            break;
+                        }
+                        log_index += 1;
+                        index_in_append_args += 1;
                     }
-                    log_index += 1;
-                    index_in_append_args += 1;
-                }
-                // append entry from conflict entry or from rest append entry
-                for i in index_in_append_args..args.entrys.len() {
-                    let entry = labcodec::decode::<Entry>(args.entrys.get(i).unwrap()).unwrap();
-                    logs.push(entry);
-                }
+                    // append entry from conflict entry or from rest append entry
+                    for i in index_in_append_args..args.entrys.len() {
+                        let entry = labcodec::decode::<Entry>(args.entrys.get(i).unwrap()).unwrap();
+                        self.persistent_state.logs.push(entry);
+                    }
 
-                if self.volatile_state.commit_index < args.leader_commit
-                    && self.last_log_index() as u64 > self.volatile_state.commit_index
-                {
-                    let end = min(self.last_log_index(), args.leader_commit as usize) as u64;
-                    for i in self.volatile_state.commit_index + 1..end + 1 {
-                        let entry = self.persistent_state.logs.get(i as usize).unwrap();
-                        let apply_msg = ApplyMsg::Command {
-                            data: entry.data.clone(),
-                            index: i as u64,
-                        };
-                        let data = match &apply_msg {
-                            ApplyMsg::Command { data, index: _ } => data,
-                            ApplyMsg::Snapshot {
-                                data,
-                                term: _,
-                                index: _,
-                            } => data,
-                        };
-                        info!(
+                    if self.volatile_state.commit_index < args.leader_commit
+                        && self.last_log_index() as u64 > self.volatile_state.commit_index
+                    {
+                        let end = min(self.last_log_index(), args.leader_commit as usize) as u64;
+                        for i in self.volatile_state.commit_index + 1..end + 1 {
+                            let entry = self.persistent_state.logs.get(i).unwrap();
+                            let apply_msg = ApplyMsg::Command {
+                                data: entry.data.clone(),
+                                index: i as u64,
+                            };
+                            let data = match &apply_msg {
+                                ApplyMsg::Command { data, index: _ } => data,
+                                ApplyMsg::Snapshot {
+                                    data,
+                                    term: _,
+                                    index: _,
+                                } => data,
+                            };
+                            info!(
                             "{} apply entry {:?} to index {},accept append from {},data is {:?}",
                             self.me, apply_msg, i, args.leader_id, data
                         );
-                        let res = self.apply_tx.unbounded_send(apply_msg);
-                        if res.is_err() {
-                            warn!("send apply msg error {:?}", res);
+                            let res = self.apply_tx.unbounded_send(apply_msg);
+                            if res.is_err() {
+                                warn!("send apply msg error {:?}", res);
+                            }
                         }
+                        self.volatile_state.commit_index = end;
                     }
-                    self.volatile_state.commit_index = end;
                 }
             }
 
@@ -802,20 +914,32 @@ impl Raft {
             }
         });
     }
-    fn entry_term(&self, index: usize) -> u64 {
-        let entry = &self.persistent_state.logs[index];
-        return entry.term;
+    fn index_term(&self, index: usize) -> Option<u64> {
+        let entry = &self.persistent_state.logs.get(index as u64);
+        return entry.map(|e| e.term);
     }
+
+    fn last_entry_index_term(&self) -> (u64, u64) {
+        if let Some((i, t)) = self.persistent_state.logs.last_entry_index_term() {
+            (i, t)
+        } else {
+            (
+                self.snapshot.as_ref().unwrap().index,
+                self.snapshot.as_ref().unwrap().term.clone(),
+            )
+        }
+    }
+
     fn term_first_index(&self, entry_index: usize) -> u64 {
         if entry_index == 0 {
             return 0;
         }
         let mut res = entry_index;
-        let entry_term = self.entry_term(res);
+        let entry_term = self.index_term(res);
         loop {
             assert!(res > 0);
             res -= 1;
-            let term = self.entry_term(res);
+            let term = self.index_term(res);
             if term != entry_term {
                 return (res + 1) as u64;
             }
@@ -827,6 +951,7 @@ impl Raft {
             if peer_id == self.me {
                 continue;
             }
+            // todo check if next index exits,or install snapshot
             self.send_append_to(peer_id, c);
         }
     }
@@ -846,9 +971,9 @@ impl Raft {
         );
 
         let mut entrys = vec![];
-        for i in (*next_index as usize)..self.persistent_state.logs.len() {
+        for i in (*next_index as usize)..self.persistent_state.logs.len() as usize {
             let mut data = vec![];
-            let entry = self.persistent_state.logs.get(i).unwrap();
+            let entry = self.persistent_state.logs.get(i as u64).unwrap();
             labcodec::encode(entry, &mut data).expect("encode entry fail");
             entrys.push(data);
         }
@@ -857,7 +982,7 @@ impl Raft {
             leader_id: self.me as u64,
             term: self.persistent_state.term,
             prev_log_index: (*next_index - 1),
-            prev_log_term: self.entry_term((*next_index - 1) as usize),
+            prev_log_term: self.index_term((*next_index - 1) as usize).unwrap(),
             leader_commit: self.volatile_state.commit_index,
             entrys,
         };
@@ -1027,14 +1152,14 @@ impl Raft {
 
     // index begin from 0 on start
     pub fn last_log_index(&self) -> usize {
-        self.persistent_state.logs.len() - 1
+        (self.persistent_state.logs.len() - 1) as usize
     }
     // term begin from 0 on start
     pub fn last_log_term(&self) -> u64 {
-        let e = self.persistent_state.logs.last();
+        let e = self.persistent_state.logs.last_entry_index_term();
         match e {
-            None => 0,
-            Some(a) => a.term,
+            None => self.snapshot.as_ref().unwrap().term,
+            Some(a) => a.1,
         }
     }
     pub fn is_election_time_out(&self, time: u64) -> bool {
@@ -1222,7 +1347,7 @@ impl Node {
             s.p_state.term,
             s.p_state.voted_for,
             s.p_state.logs.len(),
-            s.p_state.logs.last()
+            s.p_state.logs.get(s.p_state.logs.len())
         );
     }
 
@@ -1346,7 +1471,10 @@ pub mod my_tests {
     use labcodec::Message;
     use labrpc::{Client, Rpc};
 
-    use super::{persister::SimplePersister, system_time_now_epoch, ApplyMsg, Entry, Node, Raft};
+    use super::{
+        persister::SimplePersister, system_time_now_epoch, ApplyMsg, Entry, Logs, Node, Raft,
+        START_COMPACT_LOG_SIZE,
+    };
     use crate::{
         proto::raftpb::RequestVoteReply,
         raft::{RaftEvent, Role},
@@ -1608,7 +1736,7 @@ pub mod my_tests {
         let term = state.p_state.term;
         let old_check_time = state.v_state.time_to_check_election_time_out;
 
-        let (tx, rx) = oneshot::channel::<AppendReply>();
+        let (tx, _rx) = oneshot::channel::<AppendReply>();
 
         n._send_event(RaftEvent::Append(
             AppendArgs {
@@ -1667,7 +1795,7 @@ pub mod my_tests {
 
         assert_eq!(log.len(), 2);
 
-        let _= log.get(1).unwrap();
+        let _ = log.get(1).unwrap();
         assert_eq!(&e.term, &term);
         assert_eq!(&e.data, &store_data);
 
@@ -1943,7 +2071,7 @@ pub mod my_tests {
         let mut r = create_raft_with_client(vec![], 0);
         let logs = &mut r.persistent_state.logs;
         // same term and index
-        logs.clear();
+        logs.truncate(0);
         log_append_entry_with_term(logs, 0);
         log_append_entry_with_term(logs, 1);
         log_append_entry_with_term(logs, 2);
@@ -1966,7 +2094,7 @@ pub mod my_tests {
             let term = 3;
             r.persistent_state.term = term;
             let logs = &mut r.persistent_state.logs;
-            logs.clear();
+            logs.truncate(0);
             log_append_entry_with_term(logs, 0);
             log_append_entry_with_term(logs, 1);
             log_append_entry_with_term(logs, 2);
@@ -1998,7 +2126,7 @@ pub mod my_tests {
             let term = 3;
             r.persistent_state.term = term;
             let logs = &mut r.persistent_state.logs;
-            logs.clear();
+            logs.truncate(0);
             log_append_entry_with_term(logs, 0);
             log_append_entry_with_term(logs, 3);
             log_append_entry_with_term(logs, 3);
@@ -2033,7 +2161,7 @@ pub mod my_tests {
             let term = 3;
             r.persistent_state.term = term;
             let logs = &mut r.persistent_state.logs;
-            logs.clear();
+            logs.truncate(0);
             // logs:[0,2,2,3]
             log_append_entry_with_term(logs, 0);
             log_append_entry_with_term(logs, 2);
@@ -2069,7 +2197,7 @@ pub mod my_tests {
         // prev entry not exits
         let logs = &mut r.persistent_state.logs;
         // log term is [0,1,2]
-        logs.clear();
+        logs.truncate(0);
         log_append_entry_with_term(logs, 0);
         log_append_entry_with_term(logs, 1);
         log_append_entry_with_term(logs, 2);
@@ -2126,7 +2254,7 @@ pub mod my_tests {
         r.persistent_state.term = 3;
 
         let logs = &mut r.persistent_state.logs;
-        logs.clear();
+        logs.truncate(0);
         log_append_entry_with_term(logs, 0);
         log_append_entry_with_term(logs, 1);
         log_append_entry_with_term(logs, 2);
@@ -2168,7 +2296,7 @@ pub mod my_tests {
         r.persistent_state.term = 3;
 
         let logs = &mut r.persistent_state.logs;
-        logs.clear();
+        logs.truncate(0);
         log_append_entry_with_term(logs, 0);
         log_append_entry_with_term(logs, 1);
         log_append_entry_with_term(logs, 2);
@@ -2201,7 +2329,7 @@ pub mod my_tests {
         assert_eq!(s.p_state.logs.get(5).unwrap().term, 3);
     }
 
-    fn log_append_entry_with_term(logs: &mut Vec<Entry>, term: u64) {
+    fn log_append_entry_with_term(logs: &mut Logs, term: u64) {
         logs.push(Entry {
             data: vec![],
             term: term,
@@ -2222,7 +2350,7 @@ pub mod my_tests {
     fn debug() {
         let a = async {};
         let b = async { block_on(a) };
-        let _= block_on(b);
+        let _ = block_on(b);
     }
 
     fn get_send_rpc<T: Message>(mut rx: UnboundedReceiver<Rpc>) -> (T, UnboundedReceiver<Rpc>) {
@@ -2241,5 +2369,66 @@ pub mod my_tests {
         let rx = t.join().unwrap();
         debug!("receive rpc {:?}", res);
         (res, rx)
+    }
+
+    #[test]
+    fn test_log() {
+        let mut logs = Logs::new();
+        assert_eq!(logs.len(), 1);
+        assert!(logs.get(0).is_some());
+        assert!(logs.get(1).is_none());
+        logs.push(Entry {
+            data: vec![],
+            term: 1,
+        });
+        logs.push(Entry {
+            data: vec![],
+            term: 2,
+        });
+        assert_eq!(logs.len(), 3);
+        assert!(logs.get(2).is_some());
+        assert_eq!(logs.last_entry_index_term(), Some((2, 2)));
+        assert!(logs.get(4).is_none());
+
+        logs.truncate(2);
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs.get(1).unwrap().term, 1);
+        assert!(logs.get(2).is_none());
+
+        logs.push(Entry {
+            data: vec![],
+            term: 1,
+        });
+        let s = logs.compact(2);
+        assert_eq!(s.index, 1);
+        assert_eq!(s.term, 1);
+        assert_eq!(logs.entry_in_log_len(), 1);
+        assert_eq!(logs.len(), 3);
+    }
+
+    #[test]
+    fn test_auto_compact() {
+        let r = create_raft_with_client(vec![], 0);
+
+        let n = Node::_new_disable_timer(r);
+        // let (tx, rx) = oneshot::channel();
+        // let mut args = AppendArgs {
+        for i in 0..100 + START_COMPACT_LOG_SIZE {
+            // n._send_event(RaftEvent::Append(
+            // AppendArgs {
+            // leader_id: (),
+            // term: (),
+            // prev_log_index: (),
+            // prev_log_term: (),
+            // leader_commit: (),
+            // entrys: (),
+            // },
+            // (),
+            // ))
+        }
+        // check log
+        let s = n.get_state();
+        let logs = s.p_state.logs;
+        assert!(logs.entry_in_log_len() < START_COMPACT_LOG_SIZE);
     }
 }
