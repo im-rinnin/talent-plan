@@ -34,6 +34,17 @@ message AppendReply {
     uint64 conflict_entry_term=4;
     uint64 logs_len=5;
 }
+message InstallSnapshotRpc {
+    uint64 leader_id = 1;
+    uint64 term = 2;
+    uint64 last_include_index=3;
+    uint64 last_include_term=4;
+    bytes data=5;
+}
+message InstallSnapshotRpcReply {
+    uint64 term = 1;
+    bool success=2;
+}
 message MessageForTest {
     uint64 data=1;
 }

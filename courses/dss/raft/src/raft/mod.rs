@@ -36,7 +36,6 @@ use crate::proto::raftpb::*;
 const HEARTBEAT_CHECK_INTERVAL: u64 = 40;
 const ELECTION_TIMEOUT_MIN_TIME: u64 = 150;
 const ELECTION_TIMEOUT_RANGE: u64 = 150;
-const START_COMPACT_LOG_SIZE: u64 = 1000;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -77,26 +76,6 @@ pub struct Logs {
     #[prost(message, repeated, tag = "2")]
     entries: Vec<Entry>,
 }
-
-#[derive(Clone, Message)]
-pub struct Snapshot {
-    // last entry term
-    #[prost(uint64, tag = "1")]
-    term: u64,
-    // last entry index
-    #[prost(uint64, tag = "2")]
-    index: u64,
-    #[prost(message, repeated, tag = "3")]
-    data: Vec<Entry>,
-}
-
-impl Snapshot {
-    // just copy log,need customer provide apply function to apply multiple entry into statemachine
-    fn new(data: Vec<Entry>, term: u64, index: u64) -> Self {
-        Snapshot { data, term, index }
-    }
-}
-
 impl Logs {
     fn new() -> Self {
         Logs {
@@ -109,22 +88,41 @@ impl Logs {
     }
 
     // tructate to
-    fn truncate(&mut self, size: u64) {
-        self.entries.truncate(size as usize)
+    fn truncate(&mut self, index: u64) {
+        assert!(index >= self.first_entry_index);
+        let n = index - self.first_entry_index;
+        self.entries.truncate(n as usize);
     }
-    //
-    fn compact(&mut self, n: usize) -> Snapshot {
-        assert!(n > 0);
-        let mut rest = self.entries.split_off(n);
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    // discard all entry before index (exclude)
+    // return last (index,term) in last discard entry
+    fn compact(&mut self, index: u64) -> Option<(u64, u64)> {
+        assert!(index > 0);
+        if index < self.first_entry_index {
+            return None;
+        }
+        let n = index - self.first_entry_index;
+        if n > self.entries.len() as u64 {
+            warn!(
+                "index is {} ,more than log len {}",
+                index,
+                self.entries.len()
+            );
+            return None;
+        }
+        let last_enry = self.entries.last().unwrap();
+        let mut data = vec![];
+        labcodec::encode(last_enry, &mut data).unwrap();
+
+        let mut rest = self.entries.split_off(n as usize);
         swap(&mut rest, &mut self.entries);
         let last_index = self.first_entry_index + rest.len() as u64 - 1;
         let last_term = rest.last().unwrap().term;
         self.first_entry_index = last_index + 1;
-        Snapshot {
-            data: Vec::from(rest),
-            term: last_term,
-            index: last_index,
-        }
+        Some((last_index, last_term))
     }
 
     fn push(&mut self, entry: Entry) {
@@ -141,6 +139,17 @@ impl Logs {
         }
     }
 
+    fn set_first_index(&mut self, index: u64) {
+        self.first_entry_index = index;
+    }
+    fn first_index(&mut self) -> Option<u64> {
+        if self.entries.len() > 0 {
+            Some(self.first_entry_index)
+        } else {
+            None
+        }
+    }
+
     fn get(&self, index: u64) -> Option<&Entry> {
         if index < self.first_entry_index
             || index >= self.first_entry_index + self.entries.len() as u64
@@ -149,7 +158,7 @@ impl Logs {
         }
         self.entries.get((index - self.first_entry_index) as usize)
     }
-    // exclude entry in snapshot
+    // for test
     fn entry_in_log_len(&self) -> u64 {
         self.entries.len() as u64
     }
@@ -172,13 +181,25 @@ impl Logs {
 }
 
 #[derive(Clone, Message)]
+pub struct Snapshot {
+    // last entry term
+    #[prost(uint64, tag = "1")]
+    term: u64,
+    // last entry index
+    #[prost(uint64, tag = "2")]
+    index: u64,
+    #[prost(bytes, tag = "3")]
+    data: Vec<u8>,
+}
+
+#[derive(Clone, Message)]
 pub struct PersistentState {
     #[prost(uint64, tag = "1")]
     pub term: u64,
     #[prost(uint64, optional, tag = "2")]
     pub voted_for: Option<u64>,
     #[prost(message, required, tag = "3")]
-    pub logs: Logs, // volatile state
+    pub logs: Logs,
 }
 
 #[derive(Clone, Debug)]
@@ -189,10 +210,8 @@ pub struct VolatileState {
     match_index: HashMap<u64, u64>,
     vote_record: HashSet<u64>,
     last_send_append_time: u64,
-    // update to current_time+random_time[150,300)
-    // when to update:
-    // init
-    // receive any messages from valid leader/candidate
+    // set to current_time+random_time[150,300)
+    // update when receive any messages from valid leader/candidate
     time_to_check_election_time_out: u64,
 }
 
@@ -229,6 +248,66 @@ impl State {
     }
 }
 
+#[derive(Debug)]
+struct VoteRequestEvent {
+    request: RequestVoteArgs,
+    reply: oneshot::Sender<RequestVoteReply>,
+}
+#[derive(Clone, Debug)]
+struct ClientCommandReply {
+    success: bool,
+    index: u64,
+    term: u64,
+}
+
+// |election 超时|heartbeat timeout|append|append apply|vote|vote apply|
+#[derive(Debug)]
+enum RaftEvent {
+    // (checkout_time,term)
+    CheckElectionTimeOut(u64, u64),
+    HeartBeatTimeOut(),
+    Append(AppendArgs, oneshot::Sender<AppendReply>),
+    AppendReply {
+        reply: AppendReply,
+        peer_id: u64,
+        // if append success, leader should update match index to this
+        match_index: u64,
+        // prev entry index in append, for check reorder reply
+        prev_index: u64,
+    },
+    VoteReply(RequestVoteReply),
+    Vote(VoteRequestEvent),
+
+    ReadState(Sender<State>),
+    ClientCommand {
+        data: Vec<u8>,
+        reply: Sender<ClientCommandReply>,
+    },
+    Snapshot {
+        index: u64,
+        data: Vec<u8>,
+    },
+    InstallSnapshotRpc {
+        data: Vec<u8>,
+        last_entry_index: u64,
+        last_entry_term: u64,
+        term: u64,
+    },
+    InstallSnapshot {
+        data: Vec<u8>,
+        index: u64,
+        term: u64,
+        reply: crossbeam_channel::Sender<(bool, u64)>,
+    },
+    InstallSnapshotReply {
+        peer_id: u64,
+        term: u64,
+        success: bool,
+        last_index: u64,
+    },
+    Stop,
+}
+
 // A single Raft peer.
 pub struct Raft {
     // RPC end points of all peers
@@ -240,15 +319,15 @@ pub struct Raft {
     volatile_state: VolatileState,
     persistent_state: PersistentState,
     snapshot: Option<Snapshot>,
-    // other state
     rx: Receiver<RaftEvent>,
     tx: Sender<RaftEvent>,
-    // (checkout_time,term)
+    // (checkout_time,term) use term to validate if it is staled
     election_time_out_tx: Sender<(u64, u64)>,
     apply_tx: UnboundedSender<ApplyMsg>,
-    disable_timer: bool, // Your data here (2A, 2B, 2C).
-                         // Look at the paper's Figure 2 for a description of what
-                         // state a Raft server must maintain.
+    disable_timer: bool,
+    // Your data here (2A, 2B, 2C).
+    // Look at the paper's Figure 2 for a description of what
+    // state a Raft server must maintain.
 }
 
 impl Raft {
@@ -267,6 +346,7 @@ impl Raft {
         apply_ch: UnboundedSender<ApplyMsg>,
     ) -> Raft {
         let raft_state = persister.raft_state();
+        let snapshot_data = persister.snapshot();
         let (tx, rx) = crossbeam_channel::unbounded::<RaftEvent>();
 
         let mut p = PersistentState::default();
@@ -294,8 +374,11 @@ impl Raft {
         rf.set_up_election_timeout_checker(election_rx);
 
         // initialize from state persisted before a crash
-        rf.restore(&raft_state);
-        assert!(rf.persistent_state.term >= rf.last_log_term());
+        rf.restore(&raft_state, &snapshot_data);
+        // update commite index to last index in snapshot
+        if let Some(s) = &rf.snapshot {
+            rf.volatile_state.commit_index = s.index;
+        }
 
         rf
     }
@@ -319,13 +402,12 @@ impl Raft {
 
     fn main(mut self) {
         loop {
-            //
             let res = self.rx.recv();
             info!("{} receive raft event {:?}", self.me, res);
             match res {
                 Err(e) => {
                     info!(
-                        "{} raft handler chan receive error {},stop handle",
+                        "{} raft handler chan receive error {:?},stop handle",
                         self.me, e
                     );
                     return;
@@ -365,9 +447,65 @@ impl Raft {
                             .expect("send read state reply failed");
                     }
                     RaftEvent::ClientCommand { data, reply } => self.handle_command(data, reply),
+                    RaftEvent::Snapshot { index, data } => self.handle_snapshot(index, data),
+                    RaftEvent::InstallSnapshot {
+                        data,
+                        index,
+                        term,
+                        reply,
+                    } => self.handle_install_snapshot(data, index, term, reply),
+                    RaftEvent::InstallSnapshotRpc {
+                        data,
+                        last_entry_index,
+                        last_entry_term,
+                        term,
+                    } => self.handle_install_snapshot_rpc(
+                        term,
+                        data,
+                        last_entry_term,
+                        last_entry_index,
+                    ),
+                    RaftEvent::InstallSnapshotReply {
+                        term,
+                        success,
+                        peer_id,
+                        last_index,
+                    } => self.handle_install_snapshot_reply(peer_id, success, term, last_index),
+                    RaftEvent::Stop => {
+                        info!("{} rece stop event,return", self.me);
+                        return;
+                    }
                 },
             }
         }
+    }
+
+    fn handle_install_snapshot_rpc(
+        &mut self,
+        term: u64,
+        data: Vec<u8>,
+        last_entry_term: u64,
+        last_entry_index: u64,
+    ) {
+        if term < self.persistent_state.term {
+            info!(
+                "{} recv install snapshot rpc ,term is {} less than me {},ignore",
+                self.me, term, self.persistent_state.term
+            );
+            return;
+        }
+        self.becomes_follower(term, None);
+        info!("{} send apply msg snapshot ", self.me);
+        let msg = ApplyMsg::Snapshot {
+            data,
+            term: last_entry_term,
+            index: last_entry_index,
+        };
+        let res = self.apply_tx.unbounded_send(msg);
+        if res.is_err() {
+            warn!("send apply msg error {:?}", res);
+        }
+        info!("{} send apply msg snapshot successful", self.me);
     }
     fn run_with_timer(self, enable_timer: bool) -> Sender<RaftEvent> {
         self.run_with_timer_role(enable_timer, Role::FOLLOWER)
@@ -532,7 +670,7 @@ impl Raft {
             self.volatile_state.vote_record.insert(reply.peer_id);
             if self.volatile_state.vote_record.len() >= self.peers.len() / 2 + 1 {
                 self.become_leader();
-                self.send_append_to_all_client();
+                self.sync_all_other_raft();
             }
         }
     }
@@ -557,121 +695,122 @@ impl Raft {
                 self.me, reply.term, self.persistent_state.term
             );
             return;
-        } else if reply.term == self.persistent_state.term {
-            // check if reply is stale
-            let next_index = self.volatile_state.next_index.get_mut(&peer_id).unwrap();
-            if *next_index - 1 != prev_index {
-                warn!("{} receive a reorder reply, prev index is {},current next_index is {},ignore it ", self.me,prev_index,*next_index);
-                return;
-            }
-            //
-            if reply.success {
-                // update next_index
-                *next_index = match_index + 1;
-                let peer_match_index = self.volatile_state.match_index.get_mut(&peer_id).unwrap();
-                *peer_match_index = match_index;
-                //  update commit index
-                // add this node log last index
-                let mut match_indexs = vec![(self.persistent_state.logs.len() - 1) as u64];
-                // add other raft match index
-                for (id, index) in &self.volatile_state.match_index {
-                    if (*id as usize) == self.me {
-                        continue;
-                    }
-                    match_indexs.push(*index);
-                }
-                match_indexs.sort();
-                match_indexs.reverse();
-                let n = match_indexs.get(match_indexs.len() / 2).unwrap();
-                info!("{} current major match index is {} ,match indexs is {:?},current commit index is {}",self.me,*n,match_indexs,self.volatile_state.commit_index);
-
-                if *n > self.volatile_state.commit_index
-                    && self.index_term(*n as usize).expect("fail to get term in")
-                        == self.persistent_state.term
-                {
-                    info!("{} update committed index to {}", self.me, *n);
-                    for index in (self.volatile_state.commit_index + 1) as usize..(*n + 1) as usize
-                    {
-                        let entry = self
-                            .persistent_state
-                            .logs
-                            .get(index as u64)
-                            .expect("index  not commit,should not be compact to snapshot");
-                        let apply_msg = ApplyMsg::Command {
-                            data: entry.data.clone(),
-                            index: index as u64,
-                        };
-                        let data = match &apply_msg {
-                            ApplyMsg::Command { data, index: _ } => data,
-                            ApplyMsg::Snapshot {
-                                data,
-                                term: _,
-                                index: _,
-                            } => data,
-                        };
-                        info!(
-                            "{} apply entry {:?} to index {} for apped apply,data is {:?}",
-                            self.me, apply_msg, index, data
-                        );
-                        let res = self.apply_tx.unbounded_send(apply_msg);
-                        if res.is_err() {
-                            info!("{} send apply msg error {:?}", self.me, res)
-                        }
-                    }
-                    self.volatile_state.commit_index = *n;
-                }
-            } else {
-                let next_index = self.volatile_state.next_index.get_mut(&peer_id).unwrap();
-                let conflict_entry_term = reply.conflict_entry_term;
-                if reply.conflict_entry_term == 0 {
-                    // not exits,next_index=reply.logs_len
-                    assert!(reply.logs_len > 0);
-                    *next_index = reply.logs_len;
-                } else {
-                    // check if conflict term exit in leader log
-                    let same_term_index_res = self
-                        .persistent_state
-                        .logs
-                        .index_of_term(conflict_entry_term);
-                    // .persistent_state
-                    // .logs
-                    // .binary_search_by(|a| a.term.cmp(&conflict_entry_term));
-                    match same_term_index_res {
-                        // term found in leader
-                        Some(mut index) => {
-                            // not same as prev term,next_index=last entry index in term
-                            let last_index = {
-                                loop {
-                                    let term =
-                                        self.persistent_state.logs.get(index + 1).unwrap().term;
-                                    if term != conflict_entry_term {
-                                        break;
-                                    }
-                                    index += 1;
-                                }
-                                index
-                            };
-                            *next_index = last_index as u64;
-                        }
-                        // term but not found in leader,next_index=reply.conflict_entry_term_first_index
-                        None => {
-                            assert!(reply.conflict_entry_term_first_index > 0);
-                            assert!(reply.conflict_entry_term_first_index < *next_index);
-                            *next_index = reply.conflict_entry_term_first_index;
-                        }
-                    }
-                }
-                // resend append
-                // todo check if next_index exits
-                self.send_append_to(peer_id as usize, self.peers.get(peer_id as usize).unwrap());
-                // todo send snapshot
-            }
-        } else {
+        }
+        if reply.term > self.persistent_state.term {
             info!(
                 "{} accept append reply ,term is bigger than me ,{} become follower",
                 self.me, self.me
             );
             self.becomes_follower(reply.term, None);
+            return;
+        }
+        // reply.term == self.persistent_state.term
+        // check if reply is stale
+        let next_index = self.volatile_state.next_index.get(&peer_id).unwrap();
+        if *next_index - 1 != prev_index {
+            warn!(
+                "{} receive a reorder reply, prev index is {},current next_index is {},ignore it ",
+                self.me, prev_index, *next_index
+            );
+            return;
+        }
+        //
+        if reply.success {
+            self.handle_append_success(match_index, &peer_id);
+        } else {
+            let next_index = self.volatile_state.next_index.get_mut(&peer_id).unwrap();
+            let conflict_entry_term = reply.conflict_entry_term;
+            if reply.conflict_entry_term == 0 {
+                // not exits,next_index=reply.logs_len
+                assert!(reply.logs_len > 0);
+                *next_index = reply.logs_len;
+            } else {
+                // check if conflict term exit in leader log
+                let same_term_index_res = self
+                    .persistent_state
+                    .logs
+                    .index_of_term(conflict_entry_term);
+                // .persistent_state
+                // .logs
+                // .binary_search_by(|a| a.term.cmp(&conflict_entry_term));
+                match same_term_index_res {
+                    // term found in leader
+                    Some(mut index) => {
+                        // not same as prev term,next_index=last entry index in term
+                        let last_index = {
+                            loop {
+                                let term = self.persistent_state.logs.get(index + 1).unwrap().term;
+                                if term != conflict_entry_term {
+                                    break;
+                                }
+                                index += 1;
+                            }
+                            index
+                        };
+                        *next_index = last_index as u64;
+                    }
+                    // term but not found in leader,next_index=reply.conflict_entry_term_first_index
+                    None => {
+                        assert!(reply.conflict_entry_term_first_index > 0);
+                        assert!(reply.conflict_entry_term_first_index < *next_index);
+                        *next_index = reply.conflict_entry_term_first_index;
+                    }
+                }
+            }
+            // resend append
+            self.sync_raft(peer_id as usize);
+            // send snapshot
+        }
+    }
+
+    fn handle_append_success(&mut self, match_index: u64, peer_id: &u64) {
+        let next_index = self.volatile_state.next_index.get_mut(&peer_id).unwrap();
+        // update next_index
+        *next_index = match_index + 1;
+        let peer_match_index = self.volatile_state.match_index.get_mut(peer_id).unwrap();
+        *peer_match_index = match_index;
+        //  update commit index
+        // add this node log last index
+        let mut match_indexs = vec![(self.persistent_state.logs.len() - 1) as u64];
+        // add other raft match index
+        for (id, index) in &self.volatile_state.match_index {
+            if (*id as usize) == self.me {
+                continue;
+            }
+            match_indexs.push(*index);
+        }
+        match_indexs.sort();
+        match_indexs.reverse();
+        let n = match_indexs.get(match_indexs.len() / 2).unwrap();
+        info!(
+            "{} current major match index is {} ,match indexs is {:?},current commit index is {}",
+            self.me, *n, match_indexs, self.volatile_state.commit_index
+        );
+
+        if *n > self.volatile_state.commit_index
+            && self.index_term(*n as usize).expect("fail to get term in")
+                == self.persistent_state.term
+        {
+            info!("{} update committed index to {}", self.me, *n);
+            for index in (self.volatile_state.commit_index + 1) as usize..(*n + 1) as usize {
+                let entry = self
+                    .persistent_state
+                    .logs
+                    .get(index as u64)
+                    .expect("index  not commit,should not be compact to snapshot");
+                let apply_msg = ApplyMsg::Command {
+                    data: entry.data.clone(),
+                    index: index as u64,
+                };
+                info!(
+                        "{} leader apply entry {:?} to index {} for apped apply,data is {:?}, data len is {}",
+                        self.me, apply_msg, index, entry.data,entry.data.len());
+                let res = self.apply_tx.unbounded_send(apply_msg);
+                if res.is_err() {
+                    info!("{} send apply msg error {:?}", self.me, res)
+                }
+            }
+            self.volatile_state.commit_index = *n;
         }
     }
 
@@ -690,102 +829,123 @@ impl Raft {
                 logs_len: self.persistent_state.logs.len() as u64,
             }
         } else {
-            info!(
-                "{} accept append from {},term is eq or more than me, {} become follower",
-                self.me, args.leader_id, self.me
-            );
-            self.becomes_follower(args.term, None);
-            let mut accept = false;
-            let mut conflict_entry_term_first_index = 0;
-            let mut conflict_entry_term = 0;
-
-            // append/tructe log if match, or refuse log change
-            let max_index = self.last_log_index() as u64;
-            if max_index < args.prev_log_index {
-                info!("prev entry not found, refuse append")
-            } else {
-                let prev_index_term = self
-                    .index_term(args.prev_log_index as usize)
-                    .expect("prev index term not found in append");
-                if prev_index_term != args.prev_log_term {
-                    info!("prev entry not match,refuse append,index is {}, entry term is {}, args prev log term is {}",args.prev_log_index, prev_index_term,args.term);
-                    conflict_entry_term = prev_index_term;
-                    conflict_entry_term_first_index =
-                        self.term_first_index(args.prev_log_index as usize);
-                } else {
-                    accept = true;
-                    // check first entry conflict
-                    let mut log_index = args.prev_log_index + 1;
-                    let mut index_in_append_args = 0;
-                    while log_index <= max_index && index_in_append_args < args.entrys.len() {
-                        let term = self
-                            .index_term(log_index as usize)
-                            .expect("faill find term in append entry check");
-                        let append_term = labcodec::decode::<Entry>(
-                            args.entrys.get(index_in_append_args).unwrap(),
-                        )
-                        .unwrap()
-                        .term;
-                        if term != append_term {
-                            // discard entry start from conflict entry
-                            self.persistent_state.logs.truncate(log_index);
-                            break;
-                        }
-                        log_index += 1;
-                        index_in_append_args += 1;
-                    }
-                    // append entry from conflict entry or from rest append entry
-                    for i in index_in_append_args..args.entrys.len() {
-                        let entry = labcodec::decode::<Entry>(args.entrys.get(i).unwrap()).unwrap();
-                        self.persistent_state.logs.push(entry);
-                    }
-
-                    if self.volatile_state.commit_index < args.leader_commit
-                        && self.last_log_index() as u64 > self.volatile_state.commit_index
-                    {
-                        let end = min(self.last_log_index(), args.leader_commit as usize) as u64;
-                        for i in self.volatile_state.commit_index + 1..end + 1 {
-                            let entry = self.persistent_state.logs.get(i).unwrap();
-                            let apply_msg = ApplyMsg::Command {
-                                data: entry.data.clone(),
-                                index: i as u64,
-                            };
-                            let data = match &apply_msg {
-                                ApplyMsg::Command { data, index: _ } => data,
-                                ApplyMsg::Snapshot {
-                                    data,
-                                    term: _,
-                                    index: _,
-                                } => data,
-                            };
-                            info!(
-                            "{} apply entry {:?} to index {},accept append from {},data is {:?}",
-                            self.me, apply_msg, i, args.leader_id, data
-                        );
-                            let res = self.apply_tx.unbounded_send(apply_msg);
-                            if res.is_err() {
-                                warn!("send apply msg error {:?}", res);
-                            }
-                        }
-                        self.volatile_state.commit_index = end;
-                    }
-                }
-            }
-
-            self.save_persist_state();
-            AppendReply {
-                term: self.persistent_state.term,
-                success: accept,
-                conflict_entry_term_first_index: conflict_entry_term_first_index,
-                conflict_entry_term: conflict_entry_term,
-                logs_len: self.persistent_state.logs.len() as u64,
-            }
+            self.handle_valid_append(args)
         };
 
         info!("{} send append reply {:?}", self.me, reply);
         reply_ch
             .send(reply)
             .expect("send append reply to chan failed");
+    }
+
+    fn handle_valid_append(&mut self, args: AppendArgs) -> AppendReply {
+        info!(
+            "{} accept append from {},term is eq or more than me, {} become follower",
+            self.me, args.leader_id, self.me
+        );
+        self.becomes_follower(args.term, None);
+
+        // append/tructe log if match, or refuse log change
+        let max_index = self.last_log_index() as u64;
+        if max_index < args.prev_log_index {
+            info!("{} prev entry not found, refuse append", self.me);
+            return AppendReply {
+                term: self.persistent_state.term,
+                success: false,
+                conflict_entry_term_first_index: 0,
+                conflict_entry_term: 0,
+                logs_len: self.persistent_state.logs.len() as u64,
+            };
+        }
+        let prev_index_term_res = self.index_term(args.prev_log_index as usize);
+        if prev_index_term_res.is_none() {
+            info!("{} prev entry not found, refuse append", self.me);
+            return AppendReply {
+                term: self.persistent_state.term,
+                success: false,
+                conflict_entry_term_first_index: 0,
+                conflict_entry_term: 0,
+                logs_len: self.persistent_state.logs.len() as u64,
+            };
+        }
+        let prev_index_term = prev_index_term_res.unwrap();
+        if prev_index_term != args.prev_log_term {
+            info!("prev entry not match,refuse append,index is {}, entry term is {}, args prev log term is {}",args.prev_log_index, prev_index_term,args.term);
+            let conflict_entry_term = prev_index_term;
+            let conflict_entry_term_first_index =
+                self.term_first_index(args.prev_log_index as usize);
+
+            return AppendReply {
+                term: self.persistent_state.term,
+                success: false,
+                conflict_entry_term_first_index,
+                conflict_entry_term,
+                logs_len: self.persistent_state.logs.len() as u64,
+            };
+        }
+        // check first entry conflict
+        let mut log_index = args.prev_log_index + 1;
+        let mut index_in_append_args = 0;
+        while log_index <= max_index && index_in_append_args < args.entrys.len() {
+            let term_res = self.index_term(log_index as usize);
+            // .expect("faill find term in append entry check");
+            if term_res.is_none() {
+                info!("{} log index is {},max index is {},arg prev log index is {},log is {:?},snapshot is {:?}",self.me,log_index,max_index,args.prev_log_index,self.persistent_state.logs,self.snapshot);
+                // already in snapshot,skip check
+                assert!(self.snapshot.as_ref().unwrap().index > log_index);
+            } else {
+                let term = term_res.unwrap();
+                let append_term =
+                    labcodec::decode::<Entry>(args.entrys.get(index_in_append_args).unwrap())
+                        .unwrap()
+                        .term;
+                if term != append_term {
+                    // discard entry start from conflict entry
+                    self.persistent_state.logs.truncate(log_index);
+                    break;
+                }
+            }
+            log_index += 1;
+            index_in_append_args += 1;
+        }
+        // append entry from conflict entry or from rest append entry
+        for i in index_in_append_args..args.entrys.len() {
+            let entry = labcodec::decode::<Entry>(args.entrys.get(i).unwrap()).unwrap();
+            self.persistent_state.logs.push(entry);
+        }
+
+        if self.volatile_state.commit_index < args.leader_commit
+            && self.last_log_index() as u64 > self.volatile_state.commit_index
+        {
+            let end = min(self.last_log_index(), args.leader_commit as usize) as u64;
+            for i in self.volatile_state.commit_index + 1..end + 1 {
+                let entry_res = self.persistent_state.logs.get(i);
+                let entry = entry_res.unwrap();
+                let apply_msg = ApplyMsg::Command {
+                    data: entry.data.clone(),
+                    index: i as u64,
+                };
+
+                info!(
+                        "{} apply entry {:?} to index {},accept append from {},data is {:?} data len is {}",
+                        self.me, apply_msg, i, args.leader_id, entry.data,entry.data.len()
+                    );
+                let res = self.apply_tx.unbounded_send(apply_msg);
+                if res.is_err() {
+                    warn!("send apply msg error {:?}", res);
+                }
+            }
+            self.volatile_state.commit_index = end;
+        }
+
+        self.save_persist_state();
+        AppendReply {
+            term: self.persistent_state.term,
+            success: true,
+            conflict_entry_term_first_index: 0,
+            conflict_entry_term: 0,
+            logs_len: self.persistent_state.logs.len() as u64,
+        }
     }
     fn handle_command(&mut self, data: Vec<u8>, reply: Sender<ClientCommandReply>) {
         if self.volatile_state.role != Role::LEADER {
@@ -796,41 +956,132 @@ impl Raft {
                     term: 0,
                 })
                 .expect("send command reply error");
-        } else {
-            let entry = Entry {
-                data,
-                term: self.persistent_state.term,
-            };
-            self.persistent_state.logs.push(entry);
-            self.volatile_state.last_send_append_time = system_time_now_epoch();
-            self.save_persist_state();
-            self.send_append_to_all_client();
-
-            reply
-                .send(ClientCommandReply {
-                    success: true,
-                    index: (self.persistent_state.logs.len() - 1) as u64,
-                    term: self.persistent_state.term,
-                })
-                .expect("send command reply error");
+            return;
         }
+        let entry = Entry {
+            data,
+            term: self.persistent_state.term,
+        };
+        self.persistent_state.logs.push(entry);
+        self.volatile_state.last_send_append_time = system_time_now_epoch();
+        self.save_persist_state();
+        self.sync_all_other_raft();
+
+        reply
+            .send(ClientCommandReply {
+                success: true,
+                index: (self.persistent_state.logs.len() - 1) as u64,
+                term: self.persistent_state.term,
+            })
+            .expect("send command reply error");
+    }
+
+    fn handle_install_snapshot_reply(
+        &mut self,
+        peer_id: u64,
+        success: bool,
+        term: u64,
+        last_index: u64,
+    ) {
+        if term < self.persistent_state.term {
+            warn!(
+                "recevie a stale install snapshot reply,peer is {} term is {},ignore",
+                peer_id, term
+            );
+            return;
+        }
+        // check term,become follower if is greater than me
+        if term > self.persistent_state.term {
+            self.becomes_follower(term, None);
+            return;
+        }
+        if !success {
+            // resend later
+            warn!("{} send install snapshot to {} fail", self.me, peer_id);
+            return;
+        }
+        let next_index = self.volatile_state.next_index.get_mut(&peer_id).unwrap();
+        if *next_index > last_index {
+            warn!("{} receive install snapshot ,but last_index in snapshot return is {}, is less than current next_index {},ignore ", self.me, last_index,*next_index);
+            return;
+        }
+        *next_index = last_index + 1;
+        let match_index = self.volatile_state.match_index.get_mut(&peer_id).unwrap();
+        *match_index = last_index;
+        // update next index
+        self.save_persist_state();
+        // sync more log
+        self.sync_raft(peer_id as usize);
+    }
+
+    fn handle_install_snapshot(
+        &mut self,
+        data: Vec<u8>,
+        index: u64,
+        term: u64,
+        reply: crossbeam_channel::Sender<(bool, u64)>,
+    ) {
+        let logs = &mut self.persistent_state.logs;
+        // remove all log entites in snaphsot
+        match logs.get(index) {
+            Some(e) => {
+                if e.term == term {
+                    logs.compact(index + 1);
+                } else {
+                    // discard all
+                    logs.clear();
+                }
+            }
+            None => {
+                logs.clear();
+            }
+        }
+        self.snapshot = Some(Snapshot { term, index, data });
+        self.volatile_state.commit_index = index;
+        logs.set_first_index(index + 1);
+
+        // change snapshot,save
+        self.save_persist_state_and_snapshot();
+        // reply
+        reply.send((true, self.persistent_state.term)).unwrap();
+        info!(
+            "{} install snapshot index is {}, term is {} ",
+            self.me, index, term
+        );
+    }
+
+    fn handle_snapshot(&mut self, index: u64, data: Vec<u8>) {
+        // compact log
+        let term = self
+            .persistent_state
+            .logs
+            .compact(index + 1)
+            .expect("fail to log compact")
+            .1;
+        let s = Snapshot { term, index, data };
+        assert_eq!(self.persistent_state.logs.first_entry_index, s.index + 1);
+        // update snapshot
+        // save state and snapshot
+        self.snapshot = Some(s);
+        self.save_persist_state_and_snapshot();
     }
 
     fn handle_heartbeat_event(&mut self) {
         if self.volatile_state.role != Role::LEADER {
             return;
         }
+        assert!(self.volatile_state.role == Role::LEADER);
         // check last append send
         let now = system_time_now_epoch();
         if now - self.volatile_state.last_send_append_time >= HEARTBEAT_CHECK_INTERVAL {
             info!("{} heart beat timeout, send append to all node", self.me);
-            self.send_append_to_all_client();
+            self.sync_all_other_raft();
             self.volatile_state.last_send_append_time = now;
         }
     }
 
     fn become_leader(&mut self) {
-        info!("get votes from majority , {} become leader", self.me);
+        info!("{} become leader get votes from majority", self.me);
         self.volatile_state.role = Role::LEADER;
         self.volatile_state.next_index.clear();
         self.volatile_state.match_index.clear();
@@ -853,8 +1104,11 @@ impl Raft {
         let tx = self.tx.clone();
         spawn(move || loop {
             thread::sleep(Duration::from_millis(HEARTBEAT_CHECK_INTERVAL));
-            tx.send(RaftEvent::HeartBeatTimeOut())
-                .expect("send heartbeat check event error");
+            let res = tx.send(RaftEvent::HeartBeatTimeOut());
+            if res.is_err() {
+                info!("send heartbeat check event error,exit");
+                return;
+            }
         });
     }
 
@@ -866,12 +1120,9 @@ impl Raft {
         let tx = self.tx.clone();
         let _join = spawn(move || {
             loop {
-                // wait for rx
-                // get all from rx , use last one
-                // sleep and send event
-                // loop from begin
                 let mut check_time;
                 let mut term;
+                // wait for rx
                 let res = check_time_rx.recv();
                 match res {
                     Ok((c, t)) => {
@@ -883,6 +1134,7 @@ impl Raft {
                         break;
                     }
                 }
+                // get all from rx , use last one
                 while !check_time_rx.is_empty() {
                     let res = check_time_rx.try_recv();
                     match res {
@@ -896,6 +1148,7 @@ impl Raft {
                         }
                     }
                 }
+                // sleep and send event
 
                 let now = system_time_now_epoch();
                 let duration = if check_time > now {
@@ -909,14 +1162,27 @@ impl Raft {
                     duration, check_time
                 );
                 thread::sleep(Duration::from_millis(duration));
-                tx.send(RaftEvent::CheckElectionTimeOut(check_time, term))
-                    .expect("send time out check error");
+                let res = tx.send(RaftEvent::CheckElectionTimeOut(check_time, term));
+                if res.is_err() {
+                    info!("send time out check error");
+                    return;
+                }
             }
         });
     }
     fn index_term(&self, index: usize) -> Option<u64> {
         let entry = &self.persistent_state.logs.get(index as u64);
-        return entry.map(|e| e.term);
+        match entry {
+            Some(e) => Some(e.term),
+            None => {
+                if let Some(s) = &self.snapshot {
+                    if s.index == index as u64 {
+                        return Some(s.term);
+                    }
+                }
+                return None;
+            }
+        }
     }
 
     fn last_entry_index_term(&self) -> (u64, u64) {
@@ -946,43 +1212,107 @@ impl Raft {
         }
     }
 
-    fn send_append_to_all_client(&mut self) {
-        for (peer_id, c) in self.peers.iter().enumerate() {
+    fn sync_all_other_raft(&mut self) {
+        for peer_id in 0..self.peers.len() {
             if peer_id == self.me {
                 continue;
             }
-            // todo check if next index exits,or install snapshot
-            self.send_append_to(peer_id, c);
+            self.sync_raft(peer_id);
         }
     }
 
-    fn send_append_to(&self, peer_id: usize, c: &RaftClient) {
-        let next_index = self
+    fn sync_raft(&mut self, peer_id: usize) {
+        let next_index = *self
             .volatile_state
             .next_index
             .get(&(peer_id as u64))
             .expect("get match index fail");
 
-        assert!(
-            *next_index <= self.persistent_state.logs.len() as u64,
-            "next index is {},len is {}",
-            *next_index,
-            self.persistent_state.logs.len()
-        );
+        let first_index_res = self.persistent_state.logs.first_index();
+        if let Some(first_index) = first_index_res {
+            if first_index <= next_index {
+                self.send_append_to(peer_id as u64, next_index);
+                return;
+            }
+        }
+        assert!(self.snapshot.is_some());
+        self.send_install_snapshot(peer_id as u64);
+    }
+
+    fn send_install_snapshot(&self, peer_id: u64) {
+        let s = self.snapshot.as_ref().unwrap();
+        let msg = InstallSnapshotRpc {
+            data: s.data.clone(),
+            leader_id: self.me as u64,
+            last_include_index: s.index,
+            last_include_term: s.term,
+            term: self.persistent_state.term,
+        };
+        info!("{} send install snapshot {:?} to {}", self.me, msg, peer_id);
+        let c = self.peers.get(peer_id as usize).unwrap();
+        let c_clone = c.clone();
+        let tx = self.tx.clone();
+        c.spawn(async move {
+            let last_index = msg.last_include_index;
+            let res = c_clone.install_snapshot(&msg).await;
+            match res {
+                Err(e) => {
+                    warn!("send install snapshot request failed {:?} ", e);
+                    return;
+                }
+                Ok(reply) => {
+                    let res = tx.send(RaftEvent::InstallSnapshotReply {
+                        peer_id,
+                        term: reply.term,
+                        success: reply.success,
+                        last_index,
+                    });
+                    if res.is_err() {
+                        warn!("send snapshot request failed {:?}", res);
+                    }
+                }
+            }
+        });
+    }
+
+    fn send_append_to(&self, peer_id: u64, next_index: u64) {
+        let c = self.peers.get(peer_id as usize).unwrap();
 
         let mut entrys = vec![];
-        for i in (*next_index as usize)..self.persistent_state.logs.len() as usize {
+        for i in next_index..self.persistent_state.logs.len() {
             let mut data = vec![];
-            let entry = self.persistent_state.logs.get(i as u64).unwrap();
+            let e_res = self.persistent_state.logs.get(i);
+            if let None = e_res {
+                error!(
+                    " {} index is {},log len is{}",
+                    self.me,
+                    i,
+                    self.persistent_state.logs.len()
+                );
+            }
+            let entry = e_res.unwrap();
             labcodec::encode(entry, &mut data).expect("encode entry fail");
             entrys.push(data);
         }
+        let prev_log_term = match self.index_term((next_index - 1) as usize) {
+            Some(i) => i,
+            None => {
+                assert_eq!(
+                    next_index,
+                    self.snapshot.as_ref().unwrap().index + 1,
+                    "{} next index is {}",
+                    self.me,
+                    next_index
+                );
+                self.snapshot.as_ref().unwrap().term
+            }
+        };
 
         let append_request = AppendArgs {
             leader_id: self.me as u64,
             term: self.persistent_state.term,
-            prev_log_index: (*next_index - 1),
-            prev_log_term: self.index_term((*next_index - 1) as usize).unwrap(),
+            prev_log_index: (next_index - 1),
+            prev_log_term: prev_log_term,
             leader_commit: self.volatile_state.commit_index,
             entrys,
         };
@@ -1037,17 +1367,21 @@ impl Raft {
             self.send_request_vote(peer_id, request.clone(), self.tx.clone());
         }
     }
-    fn restore(&mut self, data: &[u8]) {
-        if data.is_empty() {
+    fn restore(&mut self, persiste_data: &[u8], snapshot_data: &[u8]) {
+        if persiste_data.is_empty() {
             info!("{} raft persist is empty", self.me);
             return;
         }
-        let res = labcodec::decode::<PersistentState>(data);
+        let res = labcodec::decode::<PersistentState>(persiste_data);
         match res {
             Ok(o) => self.persistent_state = o,
             Err(e) => {
                 panic!("failed to decode raft pesiste data: {:?}", e)
             }
+        }
+        if !snapshot_data.is_empty() {
+            let res = labcodec::decode::<Snapshot>(snapshot_data).unwrap();
+            self.snapshot = Some(res);
         }
     }
 
@@ -1115,27 +1449,12 @@ impl Raft {
         }
     }
 
-    fn cond_install_snapshot(
-        &mut self,
-        last_included_term: u64,
-        last_included_index: u64,
-        snapshot: &[u8],
-    ) -> bool {
-        // Your code here (2D).
-        crate::your_code_here((last_included_term, last_included_index, snapshot));
-    }
-
-    fn snapshot(&mut self, index: u64, snapshot: &[u8]) {
-        // Your code here (2D).
-        crate::your_code_here((index, snapshot));
-    }
-
     /// Only for suppressing deadcode warnings.
     #[doc(hidden)]
     pub fn __suppress_deadcode(&mut self) {
         let _ = self.start(&0);
-        let _ = self.cond_install_snapshot(0, 0, &[]);
-        self.snapshot(0, &[]);
+        let _s = Logs::new();
+        _s.entry_in_log_len();
         // let a = channel();
         // let _ = self.send_request_vote(0, Default::default(), a.0);
         let _ = &self.me;
@@ -1177,44 +1496,22 @@ impl Raft {
             .expect("encode failed");
         self.persister.save_raft_state(data);
     }
-}
-
-#[derive(Debug)]
-struct VoteRequestEvent {
-    request: RequestVoteArgs,
-    reply: oneshot::Sender<RequestVoteReply>,
-}
-#[derive(Clone, Debug)]
-struct ClientCommandReply {
-    success: bool,
-    index: u64,
-    term: u64,
-}
-
-// |election 超时|heartbeat timeout|append|append apply|vote|vote apply|
-#[derive(Debug)]
-enum RaftEvent {
-    // (checkout_time,term)
-    CheckElectionTimeOut(u64, u64),
-    HeartBeatTimeOut(),
-    Append(AppendArgs, oneshot::Sender<AppendReply>),
-    AppendReply {
-        reply: AppendReply,
-        peer_id: u64,
-        // if append success, leader should update match index to this
-        match_index: u64,
-        // prev entry index in append, for check reorder reply
-        prev_index: u64,
-    },
-    VoteReply(RequestVoteReply),
-    Vote(VoteRequestEvent),
-
-    ReadState(Sender<State>),
-
-    ClientCommand {
-        data: Vec<u8>,
-        reply: Sender<ClientCommandReply>,
-    },
+    pub fn save_persist_state_and_snapshot(&mut self) {
+        assert!(self.snapshot.is_some());
+        assert!(self.persistent_state.term >= self.last_log_term());
+        info!("{} save persiste state", self.me);
+        let mut data = Vec::new();
+        self.persistent_state
+            .encode(&mut data)
+            .expect("encode failed");
+        let mut snapshot_data = vec![];
+        self.snapshot
+            .as_ref()
+            .unwrap()
+            .encode(&mut snapshot_data)
+            .expect("encode snapshot failed");
+        self.persister.save_state_and_snapshot(data, snapshot_data);
+    }
 }
 
 // Choose concurrency paradigm.
@@ -1234,6 +1531,9 @@ enum RaftEvent {
 #[derive(Clone)]
 pub struct Node {
     tx: Arc<Mutex<Sender<RaftEvent>>>, // Your code here.
+    id: usize,
+    // (index,term)->(success,term)
+    snapshot_res: Arc<Mutex<HashMap<(u64, u64), oneshot::Sender<Result<(bool, u64)>>>>>,
 }
 
 impl Node {
@@ -1241,9 +1541,12 @@ impl Node {
     pub fn new(raft: Raft) -> Node {
         // Your code here.
         // let handler = RaftHandler::new(raft);
+        let id = raft.me;
         let tx = raft.run();
         Node {
+            id,
             tx: Arc::new(Mutex::new(tx)),
+            snapshot_res: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1251,9 +1554,12 @@ impl Node {
     fn _new_disable_timer(raft: Raft) -> Node {
         // Your code here.
         // let handler = RaftHandler::new(raft);
+        let id = raft.me;
         let tx = raft.run_with_timer(false);
         Node {
+            id,
             tx: Arc::new(Mutex::new(tx)),
+            snapshot_res: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1261,9 +1567,12 @@ impl Node {
     fn _new_wiht_timer_and_role(raft: Raft, enable_timer: bool, role: Role) -> Node {
         // Your code here.
         // let handler = RaftHandler::new(raft);
+        let id = raft.me;
         let tx = raft.run_with_timer_role(enable_timer, role);
         Node {
+            id,
             tx: Arc::new(Mutex::new(tx)),
+            snapshot_res: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1300,14 +1609,18 @@ impl Node {
             Duration::from_millis(20),
         );
         if let Err(_) = res {
-            error!("send command timeout");
-            panic!()
+            // maybe is stopped
+            return Err(Error::NotLeader);
         }
 
         let receive_res = rx.recv();
-        let res = receive_res.expect("receive client command error");
-        if res.success {
-            Ok((res.index, res.term))
+        let res = receive_res;
+        if let Ok(r) = res {
+            if r.success {
+                Ok((r.index, r.term))
+            } else {
+                Err(Error::NotLeader)
+            }
         } else {
             Err(Error::NotLeader)
         }
@@ -1324,15 +1637,13 @@ impl Node {
     }
 
     // for test
-    fn _send_event(&self, event: RaftEvent) {
+    fn send_event(&self, event: RaftEvent) {
         let t = self.tx.lock().expect("lock error");
         t.send(event).expect("send read state request error");
     }
     fn get_state(&self) -> State {
-        let t = self.tx.lock().expect("lock erro");
         let (tx, rx) = crossbeam_channel::unbounded();
-        t.send(RaftEvent::ReadState(tx))
-            .expect("send read state request error");
+        self.send_event(RaftEvent::ReadState(tx));
         let res = rx.recv().expect("read state error");
         debug!(" get state res is {:?}", res);
         res
@@ -1360,7 +1671,7 @@ impl Node {
     /// a VIRTUAL crash in tester, so take care of background
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
-        // Your code here, if desired.
+        self.send_event(RaftEvent::Stop);
     }
 
     /// A service wants to switch to snapshot.  
@@ -1373,10 +1684,42 @@ impl Node {
         last_included_index: u64,
         snapshot: &[u8],
     ) -> bool {
-        // Your code here.
-        // Example:
-        // self.raft.cond_install_snapshot(last_included_term, last_included_index, snapshot)
-        crate::your_code_here((last_included_term, last_included_index, snapshot));
+        info!(
+            "{} start cond_install_snapshot term is {},index is {}",
+            self.id, last_included_term, last_included_index
+        );
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.tx
+            .lock()
+            .unwrap()
+            .send(RaftEvent::InstallSnapshot {
+                data: Vec::from(snapshot),
+                index: last_included_index,
+                term: last_included_term,
+                reply: tx,
+            })
+            .unwrap();
+
+        let res = rx.recv();
+
+        let reply_ch = self
+            .snapshot_res
+            .lock()
+            .unwrap()
+            .remove(&(last_included_index, last_included_term));
+
+        info!("{} start cond_install_snapshot return", self.id);
+        match res {
+            Ok(r) => {
+                reply_ch.map(|ch| ch.send(Ok(r)).unwrap());
+                r.0
+            }
+            Err(e) => {
+                let e = errors::Error::Rpc(labrpc::Error::Other(e.to_string()));
+                reply_ch.map(|ch| ch.send(Err(e)).unwrap());
+                false
+            }
+        }
     }
 
     /// The service says it has created a snapshot that has all info up to and
@@ -1384,15 +1727,58 @@ impl Node {
     /// (and including) that index. Raft should now trim its log as much as
     /// possible.
     pub fn snapshot(&self, index: u64, snapshot: &[u8]) {
-        // Your code here.
-        // Example:
-        // self.raft.snapshot(index, snapshot)
-        crate::your_code_here((index, snapshot));
+        self.tx
+            .lock()
+            .unwrap()
+            .send(RaftEvent::Snapshot {
+                index: index,
+                data: Vec::from(snapshot),
+            })
+            .unwrap()
+    }
+
+    pub fn add_snapshot_result_ch(
+        &self,
+        index: u64,
+        term: u64,
+        tx: oneshot::Sender<Result<(bool, u64)>>,
+    ) {
+        self.snapshot_res.lock().unwrap().insert((index, term), tx);
     }
 }
 
 #[async_trait::async_trait]
 impl RaftService for Node {
+    async fn install_snapshot(
+        &self,
+        args: InstallSnapshotRpc,
+    ) -> labrpc::Result<InstallSnapshotRpcReply> {
+        let (tx, rx) = oneshot::channel();
+        let e = RaftEvent::InstallSnapshotRpc {
+            data: args.data,
+            last_entry_index: args.last_include_index,
+            last_entry_term: args.last_include_term,
+            term: args.term,
+        };
+        let send_res = self.tx.lock().unwrap().send(e);
+        if let Err(e) = send_res {
+            warn!("{} send install snapshot event error {:?}", self.id, e);
+            return labrpc::Result::Err(labrpc::Error::Other(e.to_string()));
+        }
+        self.add_snapshot_result_ch(args.last_include_index, args.last_include_term, tx);
+        let res = rx.await;
+        match res {
+            Ok(r) => match r {
+                Ok((res, term)) => Ok(InstallSnapshotRpcReply { term, success: res }),
+                Err(e) => labrpc::Result::Err(labrpc::Error::Other(e.to_string())),
+            },
+            Err(e) => {
+                warn!("recve install snapshot error {:?}", e);
+                labrpc::Result::Err(labrpc::Error::Other(e.to_string()))
+            }
+        }
+    }
+
     // example RequestVote RPC handler.
     //
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
@@ -1427,9 +1813,11 @@ impl RaftService for Node {
             let append_event = RaftEvent::Append(args, tx);
             {
                 let guard = self.tx.lock().expect("lock error");
-                guard
-                    .send(append_event)
-                    .expect("send append request failed");
+                let res = guard.send(append_event);
+                if let Err(e) = res {
+                    warn!("send append event error {:?}", e);
+                    return labrpc::Result::Err(labrpc::Error::Other(e.to_string()));
+                }
             }
 
             let t = rx.await;
@@ -1455,7 +1843,7 @@ pub mod my_tests {
     use std::{
         assert_eq, println,
         sync::{Arc, Mutex, Once},
-        thread,
+        thread::{self},
         time::Duration,
         vec,
     };
@@ -1473,7 +1861,6 @@ pub mod my_tests {
 
     use super::{
         persister::SimplePersister, system_time_now_epoch, ApplyMsg, Entry, Logs, Node, Raft,
-        START_COMPACT_LOG_SIZE,
     };
     use crate::{
         proto::raftpb::RequestVoteReply,
@@ -1483,7 +1870,7 @@ pub mod my_tests {
 
     fn init_logger() {
         static LOGGER_INIT: Once = Once::new();
-        LOGGER_INIT.call_once(env_logger::init);
+        LOGGER_INIT.call_once(|| env_logger::builder().format_timestamp_micros().init());
     }
 
     fn create_raft_client(name: &str) -> (RaftClient, UnboundedReceiver<Rpc>) {
@@ -1567,7 +1954,7 @@ pub mod my_tests {
         thread::sleep(Duration::from_millis(duration + 1));
 
         // 超时
-        n._send_event(RaftEvent::CheckElectionTimeOut(time, 0));
+        n.send_event(RaftEvent::CheckElectionTimeOut(time, 0));
         // assert vote
         let (reply, _) = get_send_rpc::<RequestVoteArgs>(rx);
         assert_eq!(reply.peer_id, me as u64);
@@ -1595,7 +1982,7 @@ pub mod my_tests {
         let r = create_raft_with_client(vec![c], me);
         let n = Node::_new_wiht_timer_and_role(r, false, Role::CANDIDATOR);
 
-        n._send_event(RaftEvent::VoteReply(RequestVoteReply {
+        n.send_event(RaftEvent::VoteReply(RequestVoteReply {
             term: new_term,
             vote_granted: true,
             peer_id: 0,
@@ -1671,7 +2058,7 @@ pub mod my_tests {
         let n = Node::_new_wiht_timer_and_role(r, false, Role::CANDIDATOR);
 
         let (tx, rx) = oneshot::channel::<RequestVoteReply>();
-        n._send_event(RaftEvent::Vote(super::VoteRequestEvent {
+        n.send_event(RaftEvent::Vote(super::VoteRequestEvent {
             request: RequestVoteArgs {
                 peer_id: 4,
                 term: 1,
@@ -1710,7 +2097,7 @@ pub mod my_tests {
         let n = Node::_new_disable_timer(r);
 
         let (tx, rx) = oneshot::channel::<RequestVoteReply>();
-        n._send_event(RaftEvent::Vote(super::VoteRequestEvent {
+        n.send_event(RaftEvent::Vote(super::VoteRequestEvent {
             request: RequestVoteArgs {
                 peer_id: 4,
                 term: 0,
@@ -1738,7 +2125,7 @@ pub mod my_tests {
 
         let (tx, _rx) = oneshot::channel::<AppendReply>();
 
-        n._send_event(RaftEvent::Append(
+        n.send_event(RaftEvent::Append(
             AppendArgs {
                 leader_id: 0,
                 term: term,
@@ -1786,7 +2173,7 @@ pub mod my_tests {
             entrys: vec![data],
         };
         let (tx, rx) = oneshot::channel();
-        n._send_event(RaftEvent::Append(append_request, tx));
+        n.send_event(RaftEvent::Append(append_request, tx));
         let reply = block_on(async { rx.into_future().await }).unwrap();
         assert!(reply.success);
 
@@ -1810,7 +2197,7 @@ pub mod my_tests {
         };
 
         let (tx, rx) = oneshot::channel();
-        n._send_event(RaftEvent::Append(append_request, tx));
+        n.send_event(RaftEvent::Append(append_request, tx));
 
         let res = block_on(async { rx.await }).unwrap();
         assert_eq!(res.success, false);
@@ -1826,7 +2213,7 @@ pub mod my_tests {
             entrys: vec![],
         };
         let (tx, rx) = oneshot::channel::<AppendReply>();
-        n._send_event(RaftEvent::Append(append_request, tx));
+        n.send_event(RaftEvent::Append(append_request, tx));
 
         let res = block_on(async { rx.await }).unwrap();
         assert_eq!(res.success, false);
@@ -1849,7 +2236,7 @@ pub mod my_tests {
             entrys,
         };
         let (tx, rx) = oneshot::channel();
-        n._send_event(RaftEvent::Append(append_request, tx));
+        n.send_event(RaftEvent::Append(append_request, tx));
         let res = block_on(async { rx.await }).unwrap();
         assert_eq!(res.success, true);
         assert_eq!(res.term, term);
@@ -1931,7 +2318,7 @@ pub mod my_tests {
         assert_eq!(append.prev_log_index, 0);
         assert_eq!(append.entrys.len(), 1);
         assert_eq!(state.v_state.commit_index, 0);
-        n._send_event(RaftEvent::AppendReply {
+        n.send_event(RaftEvent::AppendReply {
             reply: AppendReply {
                 term: term,
                 success: true,
@@ -1983,7 +2370,7 @@ pub mod my_tests {
         let n = Node::_new_wiht_timer_and_role(r, false, Role::LEADER);
 
         // index 2 unmatch
-        n._send_event(RaftEvent::AppendReply {
+        n.send_event(RaftEvent::AppendReply {
             reply: AppendReply {
                 term: 3,
                 success: false,
@@ -1997,7 +2384,7 @@ pub mod my_tests {
         });
 
         // index 1 unmatch
-        n._send_event(RaftEvent::AppendReply {
+        n.send_event(RaftEvent::AppendReply {
             reply: AppendReply {
                 term: 3,
                 success: false,
@@ -2013,7 +2400,7 @@ pub mod my_tests {
         assert_eq!(*s.v_state.next_index.get(&0).unwrap(), 1);
 
         // index 0 match
-        n._send_event(RaftEvent::AppendReply {
+        n.send_event(RaftEvent::AppendReply {
             reply: AppendReply {
                 term: 3,
                 success: true,
@@ -2032,7 +2419,7 @@ pub mod my_tests {
         assert_eq!(*s.v_state.next_index.get(&0).unwrap(), 2);
 
         // index 0 match
-        n._send_event(RaftEvent::AppendReply {
+        n.send_event(RaftEvent::AppendReply {
             reply: AppendReply {
                 term: 3,
                 success: true,
@@ -2056,7 +2443,7 @@ pub mod my_tests {
         let state = node.get_state();
         let old_term = state.p_state.term;
         let new_term = old_term + 1;
-        node._send_event(RaftEvent::VoteReply(RequestVoteReply {
+        node.send_event(RaftEvent::VoteReply(RequestVoteReply {
             term: new_term,
             vote_granted: false,
             peer_id: 0,
@@ -2102,7 +2489,7 @@ pub mod my_tests {
             //  term not exits in reply ,next_index =logs.len
             let n = Node::_new_wiht_timer_and_role(r, false, Role::LEADER);
             let logs_len = 2;
-            n._send_event(RaftEvent::AppendReply {
+            n.send_event(RaftEvent::AppendReply {
                 reply: AppendReply {
                     term: term,
                     success: false,
@@ -2135,7 +2522,7 @@ pub mod my_tests {
             let logs_len = 2;
             let first_index_in_term_2 = 2;
             // follower log is [0,1,2,2]
-            n._send_event(RaftEvent::AppendReply {
+            n.send_event(RaftEvent::AppendReply {
                 reply: AppendReply {
                     term: term,
                     success: false,
@@ -2171,7 +2558,7 @@ pub mod my_tests {
             let logs_len = 2;
             let first_index = 1;
             // follower log iss [0,2,2,2]
-            n._send_event(RaftEvent::AppendReply {
+            n.send_event(RaftEvent::AppendReply {
                 reply: AppendReply {
                     term: term,
                     success: false,
@@ -2212,7 +2599,7 @@ pub mod my_tests {
             leader_commit: 0,
             entrys: vec![],
         };
-        n._send_event(RaftEvent::Append(args.clone(), tx));
+        n.send_event(RaftEvent::Append(args.clone(), tx));
         let rpc = block_on(async { rx.await }).unwrap();
         assert_eq!(rpc.success, false);
 
@@ -2221,7 +2608,7 @@ pub mod my_tests {
         let (tx, rx) = oneshot::channel();
         args.prev_log_index = 2;
         args.prev_log_term = 3;
-        n._send_event(RaftEvent::Append(args.clone(), tx));
+        n.send_event(RaftEvent::Append(args.clone(), tx));
         let rpc = block_on(async { rx.await }).unwrap();
         assert_eq!(rpc.success, false);
 
@@ -2231,7 +2618,7 @@ pub mod my_tests {
         let (tx, rx) = oneshot::channel();
         args.prev_log_index = 2;
         args.prev_log_term = 2;
-        n._send_event(RaftEvent::Append(args.clone(), tx));
+        n.send_event(RaftEvent::Append(args.clone(), tx));
         let rpc: AppendReply = block_on(async { rx.await }).unwrap();
         assert_eq!(rpc.success, true);
 
@@ -2241,7 +2628,7 @@ pub mod my_tests {
         let (tx, rx) = oneshot::channel();
         args.prev_log_index = 1;
         args.prev_log_term = 1;
-        n._send_event(RaftEvent::Append(args.clone(), tx));
+        n.send_event(RaftEvent::Append(args.clone(), tx));
         let rpc: AppendReply = block_on(async { rx.await }).unwrap();
         assert_eq!(rpc.success, true);
         let s = n.get_state();
@@ -2277,7 +2664,7 @@ pub mod my_tests {
             leader_commit: 0,
             entrys: datas,
         };
-        n._send_event(RaftEvent::Append(args, tx));
+        n.send_event(RaftEvent::Append(args, tx));
         let rpc: AppendReply = block_on(async { rx.await }).unwrap();
         assert_eq!(rpc.success, true);
         let s = n.get_state();
@@ -2316,7 +2703,7 @@ pub mod my_tests {
             leader_commit: 0,
             entrys: datas,
         };
-        n._send_event(RaftEvent::Append(args, tx));
+        n.send_event(RaftEvent::Append(args, tx));
         let rpc: AppendReply = block_on(async { rx.await }).unwrap();
         assert_eq!(rpc.success, true);
         let s = n.get_state();
@@ -2346,12 +2733,7 @@ pub mod my_tests {
         data
     }
     #[test]
-    #[ignore]
-    fn debug() {
-        let a = async {};
-        let b = async { block_on(a) };
-        let _ = block_on(b);
-    }
+    fn debug() {}
 
     fn get_send_rpc<T: Message>(mut rx: UnboundedReceiver<Rpc>) -> (T, UnboundedReceiver<Rpc>) {
         let (res_tx, res_rx) = crossbeam_channel::unbounded();
@@ -2399,36 +2781,10 @@ pub mod my_tests {
             data: vec![],
             term: 1,
         });
-        let s = logs.compact(2);
-        assert_eq!(s.index, 1);
-        assert_eq!(s.term, 1);
+        let s = logs.compact(2).unwrap();
+        assert_eq!(s.0, 1);
+        assert_eq!(s.1, 1);
         assert_eq!(logs.entry_in_log_len(), 1);
         assert_eq!(logs.len(), 3);
-    }
-
-    #[test]
-    fn test_auto_compact() {
-        let r = create_raft_with_client(vec![], 0);
-
-        let n = Node::_new_disable_timer(r);
-        // let (tx, rx) = oneshot::channel();
-        // let mut args = AppendArgs {
-        for i in 0..100 + START_COMPACT_LOG_SIZE {
-            // n._send_event(RaftEvent::Append(
-            // AppendArgs {
-            // leader_id: (),
-            // term: (),
-            // prev_log_index: (),
-            // prev_log_term: (),
-            // leader_commit: (),
-            // entrys: (),
-            // },
-            // (),
-            // ))
-        }
-        // check log
-        let s = n.get_state();
-        let logs = s.p_state.logs;
-        assert!(logs.entry_in_log_len() < START_COMPACT_LOG_SIZE);
     }
 }

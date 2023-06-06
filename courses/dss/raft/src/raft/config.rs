@@ -59,7 +59,7 @@ impl Storage {
 fn init_logger() {
     use std::sync::Once;
     static LOGGER_INIT: Once = Once::new();
-    LOGGER_INIT.call_once(env_logger::init);
+    LOGGER_INIT.call_once(|| env_logger::builder().format_timestamp_micros().init());
 }
 
 pub struct Config {
@@ -151,6 +151,22 @@ impl Config {
             .map(|s| s.raft_state().len())
             .max()
             .unwrap()
+    }
+    pub fn log_all_raft_state(&self) {
+        for (i, _) in self.connected.iter().enumerate() {
+            self.rafts.lock().unwrap()[i].as_ref().unwrap()._log_state();
+        }
+    }
+
+    pub fn check_all_state(&self) {
+        for (i, _) in self.connected.iter().enumerate() {
+            let state = self.rafts.lock().unwrap()[i]
+                .as_ref()
+                .unwrap()
+                .get_state()
+                .clone();
+            warn!("check state {} state is {:?}", i, state);
+        }
     }
 
     // check that there's exactly one leader.

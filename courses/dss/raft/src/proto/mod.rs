@@ -5,6 +5,7 @@ pub mod raftpb {
         service raft {
             rpc request_vote(RequestVoteArgs) returns (RequestVoteReply);
             rpc append(AppendArgs) returns (AppendReply);
+            rpc install_snapshot(InstallSnapshotRpc) returns (InstallSnapshotRpcReply);
 
             // Your code here if more rpc desired.
             // rpc xxx(yyy) returns (zzz)
