@@ -7,6 +7,15 @@ enum Op {
     Put = 1;
     Append = 2;
 }
+enum RaftCommandType{
+    read=0;
+    put_append=1;
+
+}
+message RaftCommand{
+    RaftCommandType command_type=1;
+    bytes data =2;
+}
 
 /// Put or Append
 message PutAppendRequest {
@@ -15,15 +24,20 @@ message PutAppendRequest {
     // "Put" or "Append"
     Op op = 3;
     // You'll have to add definitions here.
+    string client_id=4;
+    uint64 request_id=5;
 }
 
 message PutAppendReply {
     bool wrong_leader = 1;
     string err = 2;
+    uint64 latest_request_id=3;
+    bool success=4;
 }
 
 message GetRequest {
     string key = 1;
+    string client_id=2;
     // You'll have to add definitions here.
 }
 
@@ -31,4 +45,20 @@ message GetReply {
     bool wrong_leader = 1;
     string err = 2;
     string value = 3;
+    bool success=4;
+}
+message StateMachine {
+    map<string,string> kv_map=1;
+    map<string,uint64> client_request_id=2;
+}
+message StateMachineDataChange {
+    string key = 1;
+    string value = 2;
+    string client_id = 3;
+    uint64 request_id = 4;
+    Op op=5;
+}
+message ReadData {
+    string key = 1;
+    string client_id = 2;
 }

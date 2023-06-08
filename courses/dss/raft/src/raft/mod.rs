@@ -1645,6 +1645,12 @@ impl Node {
         res
     }
 
+    pub fn get_state_ch(&self) -> Receiver<State> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.send_event(RaftEvent::ReadState(tx));
+        rx
+    }
+
     fn _log_state(&self) {
         let s = self.get_state();
         info!(

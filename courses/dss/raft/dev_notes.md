@@ -136,8 +136,40 @@ node send event to raft
 raft do install,return res to node by ch
 node recv res, set res to node server,return true
 
-
 #### log 抽象改造
 
 因为snapshot的存在，log不能再从0开始，而是变为一段连续的，可以被从开头截断的序列，这里需要进行一定程度的封装，而不是作为一个vec来使用
 实现变为vec+offset，offset是snapshot的lastindex+1,get_index操作变为vec.get(index-offset)
+
+### lab 3
+
+raft实现了多点顺序写入，但是如果要将其作为kv，实现 exactly 写入语义 还有其他问题解决
+
+1. 如何获知写入成功
+2. 写入失败，如何获知
+3. 写入成功，但是apply到statemachine丢失
+正常情况下，raft会把commit的entry apply到state machine，但是不保证所有commit的entry一定apply
+解决方法是重试加去重
+对于client，一直重试直到成功返回
+对于server，进行去重，client为每个请求增加一个唯一id,state machine记录所有已经写入的id，并进行去重
+记录所有id开销比较大，这里使用另外一种方法，只允许id以**严格**自增方式写入state machine，即[n，n+1,n+2...],其他不符合的id，state machine会拒绝，并返回当前id,state machine记录所有client的最新id即可
+对于小于当前写入state machine 的id的请求，可以写入raft log，但是在apply 到state machiene时会被拒绝，同时返回当前的最大id，client进行id更新后再重试
+
+4. 如何读到最新数据
+leader返回读请求之前，需要和多数节点完成一次心跳,从而保证在读取这个时间点之后，仍然是leader，实现线性一致性
+当leader选举成功时，并不清楚当前哪些log已经达到多数节点可以commit，所以需要进行一次空的append，append commit成功后，之前所有log都可以安全commit
+
+架构
+client - (rpc）- > node ->kv server--(append)->raft-(apply)->kv server--(channel)->node->client
+
+client:客户端相关，提供put get接口，持有多个node 连接
+node:服务端代码，实现了服务端相关接口，本身实现很简单，通过channel向对应的node发送相关事件
+kv server：state machine +raft,实现核心的存储功能，将请求append到raft上，当raft完成commit，将请求reply回state machine，完成数据的写入
+
+### snaphsot
+
+包括两个部分，
+snapshot 生成 server检查raft占用大小，超过指定大小后，要求raft执行compact，将log合并为一个snapshot，合并方法由kv server提供
+install snapshot，leader发现append 的prev不存在，通过install snapshot请求将snapshot发送给follower（已经实现），follower apply snapshot后，
+kv server需要将statemachine替换为snapshot的数据
+snapshot数据对raft不可见，对kv server来说就是statemachine的所有数据
