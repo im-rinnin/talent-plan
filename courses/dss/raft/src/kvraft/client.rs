@@ -1,4 +1,4 @@
-use std::{cell::RefCell, fmt, ops::Add};
+use std::{cell::RefCell, fmt, ops::Add, process::id};
 
 use futures::executor::block_on;
 use linearizability::models::Op;
@@ -48,7 +48,7 @@ impl Clerk {
             client_id: self.name.clone(),
         };
         //  pick node
-        let mut index = self.pick_node();
+        let mut index = self.pick_node(None);
         loop {
             let client = self.servers.get(index).unwrap();
             info!("{} send get request {:?} to {}", self.name, args, index);
@@ -64,12 +64,12 @@ impl Clerk {
                     }
                     if reply.wrong_leader {
                         info!("{} send append wrong leader, retry", self.name);
-                        index = self.pick_node();
+                        index = self.pick_node(Some(index));
                     }
                 }
                 Err(e) => {
                     warn!("{} send get error {:?},try other node", self.name, e);
-                    index = self.pick_node();
+                    index = self.pick_node(Some(index));
                 }
             }
         }
@@ -98,7 +98,7 @@ impl Clerk {
             },
         };
         //  pick node
-        let mut index = self.pick_node();
+        let mut index = self.pick_node(None);
         loop {
             let client = self.servers.get(index).unwrap();
             // send command wait until timeout
@@ -117,40 +117,49 @@ impl Clerk {
                         *index_ref = Some(index);
                         let mut id_ref = self.request_id.borrow_mut();
                         *id_ref += 1;
+                        debug!("{} send put append ok", self.name);
                         return;
                     }
                     if reply.wrong_leader {
                         info!("{} send append wrong leader, retry", self.name);
-                        index = self.pick_node();
+                        index = self.pick_node(Some(index));
                     }
                     // check if request_id is bigger and update
-                    if reply.latest_request_id > args.request_id {
-                        args.request_id = reply.latest_request_id + 1;
-                        let mut id_ref = self.request_id.borrow_mut();
-                        *id_ref = reply.latest_request_id + 1;
-                        info!(
+                    else if reply.latest_request_id > args.request_id {
+                        args.request_id = reply.latest_request_id;
+                        let id_ref = self.request_id.try_borrow_mut();
+                        if let Err(e) = id_ref {
+                            panic!("error borrow {:?}", e);
+                        }
+                        let mut id_ref = id_ref.unwrap();
+                        *id_ref = reply.latest_request_id;
+                        warn!(
                             "{} send append wrong request, update to {} and retry",
-                            self.name,
-                            *self.request_id.borrow()
+                            self.name, *id_ref
                         );
                     }
                 }
                 // reply error
                 Err(e) => {
                     warn!("{} send put_append error {:?},try other node", self.name, e);
-                    index = self.pick_node();
+                    index = self.pick_node(Some(index));
                 }
             }
         }
     }
 
     // pick last leader node ,if not found ,use random one
-    fn pick_node(&self) -> usize {
+    fn pick_node(&self, not_leader: Option<usize>) -> usize {
         let mut l = self.last_leader_index.borrow_mut();
         match l.take() {
             Some(index) => index,
             None => {
-                let index = rand::random::<usize>() % self.servers.len();
+                let mut index = rand::random::<usize>() % self.servers.len();
+                if let Some(i) = not_leader {
+                    if index == i {
+                        index = (index + 1) % self.servers.len()
+                    }
+                }
                 info!("{} pick node {} ", self.name, index);
                 index
             }
