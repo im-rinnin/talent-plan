@@ -31,8 +31,9 @@ message PutAppendRequest {
 message PutAppendReply {
     bool wrong_leader = 1;
     string err = 2;
-    uint64 latest_request_id=3;
+    uint64 next_request_id=3;
     bool success=4;
+    bool id_not_match= 5;
 }
 
 message GetRequest {

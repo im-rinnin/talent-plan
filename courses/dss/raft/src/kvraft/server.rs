@@ -45,6 +45,7 @@ pub struct KvServer {
     // snapshot if log grows this big
     maxraftstate: Option<usize>,
     rx: Receiver<KvServerEvent>,
+    tx: Sender<KvServerEvent>,
     get_replys: HashMap<String, oneshot::Sender<GetReply>>,
     put_append_replys: HashMap<ReplyId, oneshot::Sender<PutAppendReply>>, // Your definitions here.
 }
@@ -59,13 +60,12 @@ impl KvServer {
         // You may need initialization code here.
 
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        let event_tx_clone = event_tx.clone();
         let (tx, apply_ch) = unbounded();
         let rf = raft::Raft::new(servers, me, persister, tx);
 
-        let res = apply_ch.for_each(handle_raft_apply(event_tx_clone));
+        let res = apply_ch.for_each(handle_raft_apply(event_tx.clone()));
 
-        spawn(|| res);
+        spawn(|| block_on(res));
         let state_machine = StateMachine {
             kv_map: HashMap::new(),
             client_request_id: HashMap::new(),
@@ -79,6 +79,7 @@ impl KvServer {
             me,
             maxraftstate,
             rx: event_rx,
+            tx: event_tx,
             get_replys: HashMap::new(),
             put_append_replys: HashMap::new(),
         }
@@ -86,51 +87,55 @@ impl KvServer {
         // crate::your_code_here((rf, maxraftstate, apply_ch))
     }
     fn run(self) -> Sender<KvServerEvent> {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        spawn(move || self.main(rx));
+        let tx = self.tx.clone();
+        spawn(move || self.main());
         tx
     }
 
-    fn main(mut self, rx: Receiver<KvServerEvent>) {
+    fn main(mut self) {
+        info!("{} start event loop", self.me);
         loop {
-            info!("{} start event loop", self.me);
-            let event_res = rx.recv();
+            let event_res = self.rx.recv();
             match event_res {
                 Err(e) => {
                     info!("{} recv event error {:?},return loop", self.me, e);
                     return;
                 }
-                Ok(event) => match event {
-                    KvServerEvent::PutAppend {
-                        client_id,
-                        request_id,
-                        key,
-                        value,
-                        reply,
-                        op,
-                    } => {
-                        self.handle_put_append_request(client_id, request_id, op, key, value, reply)
+                Ok(event) => {
+                    info!("{} receive event {:?}", self.me, event);
+                    match event {
+                        KvServerEvent::PutAppend {
+                            client_id,
+                            request_id,
+                            key,
+                            value,
+                            reply,
+                            op,
+                        } => self.handle_put_append_request(
+                            client_id, request_id, op, key, value, reply,
+                        ),
+                        KvServerEvent::Get {
+                            reply,
+                            client_id,
+                            key,
+                        } => self.handle_get_request(client_id, key, reply),
+                        KvServerEvent::GetState { reply } => self.handle_get_state(reply),
+                        KvServerEvent::Stop() => {
+                            self.rf.kill();
+                            info!("{} receve stop, return", self.me);
+                            return;
+                        }
+                        KvServerEvent::DataChange(data_change) => {
+                            self.handle_put_append_apply(data_change)
+                        }
+                        KvServerEvent::InstallSnapshot(_) => todo!(),
+                        KvServerEvent::ReadData(ReadData { key, client_id }) => {
+                            self.handle_get_reply(client_id, key)
+                        }
                     }
-                    KvServerEvent::Get {
-                        reply,
-                        client_id,
-                        key,
-                    } => self.handle_get_request(client_id, key, reply),
-                    KvServerEvent::GetState { reply } => self.handle_get_state(reply),
-                    KvServerEvent::Stop() => {
-                        self.rf.kill();
-                        info!("{} receve stop, return", self.me);
-                        return;
-                    }
-                    KvServerEvent::DataChange(data_change) => {
-                        self.handle_put_append_apply(data_change)
-                    }
-                    KvServerEvent::InstallSnapshot(_) => todo!(),
-                    KvServerEvent::ReadData(ReadData { key, client_id }) => {
-                        self.handle_get_reply(client_id, key)
-                    }
-                },
+                }
             }
+            debug!("{} end loop", self.me);
         }
     }
     fn handle_put_append_request(
@@ -147,8 +152,9 @@ impl KvServer {
             let res = reply.send(PutAppendReply {
                 wrong_leader: true,
                 err: String::from("not leader"),
-                latest_request_id: 0,
+                next_request_id: 0,
                 success: false,
+                id_not_match: false,
             });
             if let Err(e) = res {
                 warn!("{} send put append reply error {:?}", self.me, e)
@@ -177,17 +183,18 @@ impl KvServer {
                 .send(PutAppendReply {
                     wrong_leader: false,
                     err: e.to_string(),
-                    latest_request_id: *self
+                    next_request_id: *self
                         .state_machine
                         .client_request_id
                         .get(&client_id)
                         .unwrap_or(&0),
                     success: false,
+                    id_not_match: false,
                 })
                 .unwrap();
             return;
         }
-
+        debug!("{} save put reply {} ", self.me, client_id);
         // save reply
         self.put_append_replys
             .insert((client_id, request_id), reply);
@@ -223,6 +230,10 @@ impl KvServer {
             data,
         };
 
+        debug!(
+            "{} handle get request, send command {:?}to raft",
+            self.me, command
+        );
         let res = self.rf.start(&command);
         if let Err(e) = res {
             warn!("{} send read data to raft error{:?}", self.me, e);
@@ -238,6 +249,7 @@ impl KvServer {
         }
 
         // save reply
+        debug!("{} save get reply {} ", self.me, client_id);
         self.get_replys.insert(client_id, reply);
     }
     fn handle_get_state(&mut self, reply: oneshot::Sender<raft::State>) {
@@ -254,35 +266,38 @@ impl KvServer {
         });
     }
     fn handle_put_append_apply(&mut self, data_change: StateMachineDataChange) {
+        debug!("{} handle put append apply {:?}", self.me, data_change);
         let reply_res = self
             .put_append_replys
             .remove(&(data_change.client_id.clone(), data_change.request_id));
         if reply_res.is_none() {
-            warn!(
+            info!(
                 "{} put_append reply {} {} not found,just ignore",
                 self.me, data_change.client_id, data_change.request_id
             );
             return;
         }
-        let reply = reply_res.unwrap();
 
         // check request id
         let id = self
             .state_machine
             .client_request_id
-            .entry(data_change.key.clone())
+            .entry(data_change.client_id.clone())
             .or_insert(0);
-        if data_change.request_id + 1 != *id {
+        if data_change.request_id != *id {
             info!(
                 "{} receive data change, requset is {},current id is {},not match reject it",
                 self.me, data_change.request_id, *id
             );
-            reply
-                .send(PutAppendReply {
-                    wrong_leader: false,
-                    err: String::from("request id not match"),
-                    latest_request_id: *id,
-                    success: false,
+            reply_res
+                .map(|reply| {
+                    let _ = reply.send(PutAppendReply {
+                        wrong_leader: false,
+                        err: String::from("request id not match"),
+                        success: false,
+                        next_request_id: *id,
+                        id_not_match: true,
+                    });
                 })
                 .unwrap();
             return;
@@ -308,25 +323,33 @@ impl KvServer {
                 error!("op {} not match", a)
             }
         }
+        // reply
+        let res = reply_res.map(|reply| {
+            reply.send(PutAppendReply {
+                wrong_leader: false,
+                err: String::new(),
+                success: true,
+                next_request_id: *id,
+                id_not_match: false,
+            })
+        });
         // update request id
         *id += 1;
-        // reply
-        let res = reply.send(PutAppendReply {
-            wrong_leader: false,
-            err: String::new(),
-            latest_request_id: *id,
-            success: true,
-        });
-        if let Err(e) = res {
+        if let Some(Err(e)) = res {
             warn!("{} send put append reply error {:?}", self.me, e);
         }
     }
 
     fn handle_get_reply(&mut self, client_id: String, key: String) {
         // get reply ch
+        debug!(
+            "{} start handle get reply for {} {}",
+            self.me, client_id, key
+        );
+
         let reply_res = self.get_replys.remove(&client_id);
         if let None = reply_res {
-            error!("{} get reply for {} not found", self.me, client_id);
+            warn!("{} get reply for {} not found", self.me, client_id);
             return;
         }
         let reply = reply_res.unwrap();
@@ -361,38 +384,60 @@ impl KvServer {
 fn handle_raft_apply(
     event_tx_clone: Sender<KvServerEvent>,
 ) -> impl Fn(raft::ApplyMsg) -> future::Ready<()> {
-    move |msg| match msg {
-        raft::ApplyMsg::Command { data, index: _ } => {
-            let command = labcodec::decode::<RaftCommand>(&data).unwrap();
-            match RaftCommandType::from_i32(command.command_type).unwrap() {
-                RaftCommandType::Read => {
-                    let read = labcodec::decode::<ReadData>(&command.data).unwrap();
-                    let res = event_tx_clone.send(KvServerEvent::ReadData(read));
-                    if let Err(e) = res {
-                        warn!("send read data error {:?}", e);
+    debug!("handle apply start");
+    move |msg| {
+        debug!("handle_raft_apply receive raft apply {:?}", msg);
+        match msg {
+            raft::ApplyMsg::Command { data, index: _ } => {
+                let command = labcodec::decode::<RaftCommand>(&data).unwrap();
+                debug!("handle read data reply");
+                match RaftCommandType::from_i32(command.command_type).unwrap() {
+                    RaftCommandType::Read => {
+                        let read = labcodec::decode::<ReadData>(&command.data).unwrap();
+                        let res = event_tx_clone.send(KvServerEvent::ReadData(read));
+                        if let Err(e) = res {
+                            warn!("send read data error {:?}", e);
+                        }
+                    }
+                    RaftCommandType::PutAppend => {
+                        debug!("handle put append reply");
+                        let put_append_request =
+                            labcodec::decode::<PutAppendRequest>(&command.data);
+                        match put_append_request {
+                            Ok(data_change) => {
+                                let event = KvServerEvent::DataChange(StateMachineDataChange {
+                                    key: data_change.key,
+                                    value: data_change.value,
+                                    client_id: data_change.client_id,
+                                    request_id: data_change.request_id,
+                                    op: data_change.op,
+                                });
+                                let res = event_tx_clone.send(event);
+                                if let Err(e) = res {
+                                    warn!("send data change error {:?}", e);
+                                }
+                                debug!("handle put append reply success");
+                            }
+                            Err(e) => {
+                                error!("decode error {:?}", e);
+                            }
+                        }
                     }
                 }
-                RaftCommandType::PutAppend => {
-                    let data_change = labcodec::decode(&command.data).unwrap();
-                    let res = event_tx_clone.send(KvServerEvent::DataChange(data_change));
-                    if let Err(e) = res {
-                        warn!("send data change error {:?}", e);
-                    }
+                future::ready(())
+            }
+            raft::ApplyMsg::Snapshot {
+                data,
+                term: _,
+                index: _,
+            } => {
+                let state_machine = labcodec::decode::<StateMachine>(&data).unwrap();
+                let res = event_tx_clone.send(KvServerEvent::InstallSnapshot(state_machine));
+                if let Err(e) = res {
+                    warn!("send install state machine error {:?}", e);
                 }
+                future::ready(())
             }
-            future::ready(())
-        }
-        raft::ApplyMsg::Snapshot {
-            data,
-            term: _,
-            index: _,
-        } => {
-            let state_machine = labcodec::decode::<StateMachine>(&data).unwrap();
-            let res = event_tx_clone.send(KvServerEvent::InstallSnapshot(state_machine));
-            if let Err(e) = res {
-                warn!("send install state machine error {:?}", e);
-            }
-            future::ready(())
         }
     }
 }

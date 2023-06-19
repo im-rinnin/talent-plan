@@ -965,6 +965,7 @@ impl Raft {
         self.persistent_state.logs.push(entry);
         self.volatile_state.last_send_append_time = system_time_now_epoch();
         self.save_persist_state();
+        debug!("{} receive command,start to sync to other node", self.me);
         self.sync_all_other_raft();
 
         reply
