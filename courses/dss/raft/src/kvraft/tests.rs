@@ -51,6 +51,7 @@ fn check(cfg: &Config, ck: &Clerk, key: &str, value: &str) {
 }
 
 // spawn ncli clients and wait until they are all done
+// create new client wait all client call once func
 fn spawn_clients_and_wait<Func, Fact>(
     cfg: Arc<Config>,
     ncli: usize,
@@ -160,10 +161,12 @@ fn partitioner(
     let mut is_parked = false;
     future::poll_fn(move |cx| {
         let mut rng = rand::thread_rng();
+        // loop until done
         while done.load(Ordering::Relaxed) == 0 {
             if !is_parked {
                 all.shuffle(&mut rng);
                 let offset = rng.gen_range(0, cfg.n);
+                // partition
                 cfg.partition(&all[..offset], &all[offset..]);
                 sleep = Some(delay(rng.gen::<u64>()));
             }
@@ -222,10 +225,12 @@ fn generic_test(
 
     cfg.begin(&title);
 
+    // create client
     let ck = cfg.make_client(&cfg.all());
 
     let done_partitioner = Arc::new(AtomicUsize::new(0));
     let done_clients = Arc::new(AtomicUsize::new(0));
+    //
     let mut clnt_txs = vec![];
     let mut clnt_rxs = vec![];
     for _ in 0..nclients {
@@ -233,6 +238,7 @@ fn generic_test(
         clnt_txs.push(tx);
         clnt_rxs.push(rx);
     }
+    // 3 loop
     for i in 0..3 {
         let (partitioner_tx, partitioner_rx) = mpsc::channel();
         debug!("Iteration {}", i);
@@ -253,12 +259,18 @@ fn generic_test(
                         let mut rng = rand::thread_rng();
                         let mut last = String::new();
                         let key = format!("{}", cli);
+                        // put
                         put(&cfg1, myck, &key, &last);
+                        // thread run until  done not zero
                         while done_clients1.load(Ordering::Relaxed) == 0 {
+                            // 50 percent to append
+                            // key not change
+                            // append change key
                             if (rng.gen::<u32>() % 1000) < 500 {
                                 let nv = format!("x {} {} y", cli, j);
                                 debug!("{}: client new append {}", cli, nv);
                                 last = next_value(last, &nv);
+                                // append  change value
                                 append(&cfg1, myck, &key, &nv);
                                 j += 1;
                             } else {

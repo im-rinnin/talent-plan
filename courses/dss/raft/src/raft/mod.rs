@@ -10,6 +10,7 @@ use std::cmp::min;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::convert::TryFrom;
 use std::mem::swap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -61,12 +62,33 @@ pub enum Role {
     CANDIDATOR = 2,
 }
 
+pub enum EntryType {
+    APPEND = 1,
+    SNAPSHOT = 2,
+}
+
+impl TryFrom<u64> for EntryType {
+    type Error = Error;
+
+    fn try_from(value: u64) -> std::result::Result<Self, Self::Error> {
+        match value {
+            x if x == EntryType::APPEND as u64 => Ok(EntryType::APPEND),
+            x if x == EntryType::SNAPSHOT as u64 => Ok(EntryType::SNAPSHOT),
+            _ => {
+                panic!("decode entry type error")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Message)]
 pub struct Entry {
     #[prost(bytes, tag = "1")]
-    data: Vec<u8>,
+    pub data: Vec<u8>,
     #[prost(uint64, tag = "2")]
     term: u64,
+    #[prost(uint64, tag = "3")]
+    pub data_type: u64,
 }
 
 #[derive(Clone, Message)]
@@ -83,6 +105,7 @@ impl Logs {
             entries: vec![Entry {
                 data: vec![],
                 term: 0,
+                data_type: EntryType::APPEND as u64,
             }],
         }
     }
@@ -200,6 +223,8 @@ pub struct PersistentState {
     pub voted_for: Option<u64>,
     #[prost(message, required, tag = "3")]
     pub logs: Logs,
+    #[prost(uint64, optional, tag = "4")]
+    pub last_apply_log_index: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -353,6 +378,7 @@ impl Raft {
         p.logs.push(Entry {
             data: vec![],
             term: 0,
+            data_type: EntryType::APPEND as u64,
         });
         let (election_tx, election_rx) = crossbeam_channel::unbounded();
 
@@ -381,6 +407,19 @@ impl Raft {
         }
 
         rf
+    }
+    pub fn copy_applyed_logs(&self) -> Vec<Entry> {
+        match self.persistent_state.last_apply_log_index {
+            Some(index) => {
+                let mut res = vec![];
+                for i in self.persistent_state.logs.first_entry_index..index + 1 {
+                    let e = self.persistent_state.logs.get(i).unwrap();
+                    res.push(e.clone());
+                }
+                res
+            }
+            None => vec![],
+        }
     }
     fn random_timeout() -> Duration {
         Duration::from_millis(
@@ -422,7 +461,10 @@ impl Raft {
                     RaftEvent::Vote(vote) => {
                         info!("{} recv vote event {:?}", self.me, &vote.request);
                         let reply = self.handle_vote(&vote.request);
-                        vote.reply.send(reply).expect("send vote reply error");
+                        let res = vote.reply.send(reply);
+                        if let Err(e) = res {
+                            info!("{} send vote reply error {:?}", self.me, e);
+                        }
                     }
                     RaftEvent::VoteReply(reply_result) => {
                         info!("{} recv vote reply {:?}", self.me, reply_result);
@@ -808,6 +850,8 @@ impl Raft {
                 if res.is_err() {
                     info!("{} send apply msg error {:?}", self.me, res)
                 }
+                self.persistent_state.last_apply_log_index = Some(index as u64);
+                self.save_persist_state();
             }
             self.volatile_state.commit_index = *n;
         }
@@ -832,9 +876,10 @@ impl Raft {
         };
 
         info!("{} send append reply {:?}", self.me, reply);
-        reply_ch
-            .send(reply)
-            .expect("send append reply to chan failed");
+        let res = reply_ch.send(reply);
+        if let Err(e) = res {
+            info!("{} send append reply to chan failed {:?}", self.me, e);
+        }
     }
 
     fn handle_valid_append(&mut self, args: AppendArgs) -> AppendReply {
@@ -934,6 +979,7 @@ impl Raft {
                 if res.is_err() {
                     warn!("send apply msg error {:?}", res);
                 }
+                self.persistent_state.last_apply_log_index = Some(i);
             }
             self.volatile_state.commit_index = end;
         }
@@ -961,10 +1007,12 @@ impl Raft {
         let entry = Entry {
             data,
             term: self.persistent_state.term,
+            data_type: EntryType::APPEND as u64,
         };
         self.persistent_state.logs.push(entry);
         self.volatile_state.last_send_append_time = system_time_now_epoch();
         self.save_persist_state();
+        debug!("{} receive command,start to sync to other node", self.me);
         self.sync_all_other_raft();
 
         reply
@@ -1632,10 +1680,12 @@ impl Node {
         self.get_state().v_state.role == Role::LEADER
     }
 
-    // for test
     fn send_event(&self, event: RaftEvent) {
         let t = self.tx.lock().expect("lock error");
-        t.send(event).expect("send read state request error");
+        let res = t.send(event);
+        if let Err(e) = res {
+            info!("{} send read state request error {:?}", self.id, e);
+        }
     }
     fn get_state(&self) -> State {
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -1643,6 +1693,12 @@ impl Node {
         let res = rx.recv().expect("read state error");
         debug!(" get state res is {:?}", res);
         res
+    }
+
+    pub fn get_state_ch(&self) -> Receiver<State> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.send_event(RaftEvent::ReadState(tx));
+        rx
     }
 
     fn _log_state(&self) {
@@ -1793,9 +1849,10 @@ impl RaftService for Node {
         };
         {
             let guard = self.tx.lock().unwrap();
-            guard
-                .send(RaftEvent::Vote(vote_event))
-                .expect("send vote request failed");
+            let res = guard.send(RaftEvent::Vote(vote_event));
+            if let Err(e) = res {
+                info!("{} send vote request failed {:?}", self.id, e);
+            }
         }
 
         let t = rx.await;
@@ -1864,7 +1921,7 @@ pub mod my_tests {
     };
     use crate::{
         proto::raftpb::RequestVoteReply,
-        raft::{RaftEvent, Role},
+        raft::{EntryType, RaftEvent, Role},
     };
     use crate::{proto::raftpb::*, raft::HEARTBEAT_CHECK_INTERVAL};
 
@@ -2083,14 +2140,17 @@ pub mod my_tests {
         logs.push(Entry {
             data: vec![1],
             term: 1,
+            data_type: EntryType::APPEND as u64,
         });
         logs.push(Entry {
             data: vec![1],
             term: 1,
+            data_type: EntryType::APPEND as u64,
         });
         logs.push(Entry {
             data: vec![1],
             term: 2,
+            data_type: EntryType::APPEND as u64,
         });
         r.persistent_state.term = 2;
 
@@ -2159,6 +2219,7 @@ pub mod my_tests {
         let e = Entry {
             data: store_data.clone(),
             term,
+            data_type: EntryType::APPEND as u64,
         };
         let mut data = Vec::new();
         labcodec::encode(&e, &mut data).unwrap();
@@ -2222,6 +2283,7 @@ pub mod my_tests {
         let e = Entry {
             data: store_data.clone(),
             term,
+            data_type: EntryType::APPEND as u64,
         };
         let mut data = Vec::new();
         labcodec::encode(&e, &mut data).unwrap();
@@ -2357,11 +2419,13 @@ pub mod my_tests {
         logs.push(Entry {
             data: vec![1],
             term: 2,
+            data_type: EntryType::APPEND as u64,
         });
 
         logs.push(Entry {
             data: vec![1],
             term: 3,
+            data_type: EntryType::APPEND as u64,
         });
 
         let n = Node::_new_wiht_timer_and_role(r, false, Role::LEADER);
@@ -2714,12 +2778,20 @@ pub mod my_tests {
     }
 
     fn log_append_entry_with_term(logs: &mut Logs, term: u64) {
-        logs.push(Entry { data: vec![], term });
+        logs.push(Entry {
+            data: vec![],
+            term,
+            data_type: EntryType::APPEND as u64,
+        });
     }
 
     fn build_entry_with_term(term: u64) -> Vec<u8> {
         let mut data = vec![];
-        let entry = Entry { data: vec![], term };
+        let entry = Entry {
+            data: vec![],
+            term,
+            data_type: EntryType::APPEND as u64,
+        };
         labcodec::encode(&entry, &mut data).unwrap();
         data
     }
@@ -2753,10 +2825,12 @@ pub mod my_tests {
         logs.push(Entry {
             data: vec![],
             term: 1,
+            data_type: EntryType::APPEND as u64,
         });
         logs.push(Entry {
             data: vec![],
             term: 2,
+            data_type: EntryType::APPEND as u64,
         });
         assert_eq!(logs.len(), 3);
         assert!(logs.get(2).is_some());
@@ -2771,6 +2845,7 @@ pub mod my_tests {
         logs.push(Entry {
             data: vec![],
             term: 1,
+            data_type: EntryType::APPEND as u64,
         });
         let s = logs.compact(2).unwrap();
         assert_eq!(s.0, 1);
